@@ -34,6 +34,10 @@ class TestLeadAssignment(unittest.TestCase):
         self.client = MagicMock(spec=LarkClient)
         # Default: field type is Person (11) for backward compatibility
         self.client.get_field_type.return_value = 11
+        # Patch is_eligible_for_distribution to True for legacy tests
+        self.patcher = patch('assigner.is_eligible_for_distribution', return_value=True)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
         
     def test_today_range(self):
         start, end = get_today_range()
@@ -619,6 +623,9 @@ class TestBatchAssignmentModes(unittest.TestCase):
     def setUp(self):
         self.client = MagicMock(spec=LarkClient)
         self.client.get_field_type.return_value = 11  # Person type by default
+        self.patcher = patch('assigner.is_eligible_for_distribution', return_value=True)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
 
     def test_mirror_mode_fills_recipient_via_roundrobin(self):
         """Mirror mode: TVV filled but Người nhận data empty → fill recipient via round-robin by region."""
@@ -1026,6 +1033,106 @@ class TestFetchActiveAgentsWeight(unittest.TestCase):
         self.assertEqual(len(active), 2)
         self.assertAlmostEqual(active[0]["weight"], 0.7)
         self.assertAlmostEqual(active[1]["weight"], 1.0)
+
+
+class TestFacebookDistribution(unittest.TestCase):
+    def setUp(self):
+        self.client = MagicMock(spec=LarkClient)
+        self.client.get_field_type.return_value = 11
+
+    def test_determine_facebook_target_capacities_basic(self):
+        from assigner import determine_facebook_target_capacities
+        active_tvvs = [
+            {"user_id": "user_n", "recipient_user_id": "user_n", "name": "North TVV", "region": "Miền Bắc"},
+            {"user_id": "user_s", "recipient_user_id": "user_s", "name": "South TVV", "region": "Miền Nam"}
+        ]
+        
+        # Scenario: 10 North leads, 3 South leads. (Total 13 leads)
+        new_leads = [
+            {"record_id": f"l_n_{i}", "fields": {"Khu vực": "Miền Bắc", "Nguồn Data": "Online - Digital MKT", "Kênh đăng ký": "Facebook"}}
+            for i in range(10)
+        ] + [
+            {"record_id": f"l_s_{i}", "fields": {"Khu vực": "Miền Nam", "Nguồn Data": "Online - Digital MKT", "Kênh đăng ký": "Facebook"}}
+            for i in range(3)
+        ]
+        
+        today_assignments = []
+        
+        target_caps = determine_facebook_target_capacities(active_tvvs, new_leads, today_assignments)
+        
+        # Expected: North TVV (10 same region leads) gets target count 7. South TVV (3 same region) gets 6.
+        self.assertEqual(target_caps["user_n"], 7)
+        self.assertEqual(target_caps["user_s"], 6)
+
+    def test_assign_facebook_leads_batch_distribution(self):
+        from assigner import assign_facebook_leads_batch, tz_vietnam
+        tvvs_records = [
+            {
+                "record_id": "rec_n",
+                "fields": {
+                    "Nhân sự": [{"id": "user_n", "name": "North TVV"}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                }
+            },
+            {
+                "record_id": "rec_s",
+                "fields": {
+                    "Nhân sự": [{"id": "user_s", "name": "South TVV"}],
+                    "Team TV": "Miền Nam",
+                    "Đi làm hôm nay": True,
+                }
+            }
+        ]
+        
+        leads = [
+            {
+                "record_id": f"lead_north_{i}",
+                "fields": {
+                    "Khu vực": "Miền Bắc",
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Facebook",
+                    "Trạng thái": "M0-Data đã claim"
+                }
+            } for i in range(10)
+        ] + [
+            {
+                "record_id": f"lead_south_{i}",
+                "fields": {
+                    "Khu vực": "Miền Nam",
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Facebook",
+                    "Trạng thái": "M0-Data đã claim"
+                }
+            } for i in range(3)
+        ]
+        
+        def mock_list_records(table_id, **kwargs):
+            if table_id == config.TABLE_TVV_ID:
+                return tvvs_records
+            elif table_id == config.TABLE_TIKTOK_ID:
+                return []
+            return []
+            
+        self.client.list_records.side_effect = mock_list_records
+        
+        # Act
+        results = assign_facebook_leads_batch(self.client, leads)
+        
+        # Assert
+        self.assertEqual(len(results), 13)
+        
+        north_tvv_assignments = [r for r in results if r[1]["user_id"] == "user_n"]
+        south_tvv_assignments = [r for r in results if r[1]["user_id"] == "user_s"]
+        
+        self.assertEqual(len(north_tvv_assignments), 7)
+        self.assertEqual(len(south_tvv_assignments), 6)
+        
+        south_leads_assigned_to_south_tvv = 0
+        for rid, tvv in south_tvv_assignments:
+            if "south" in rid:
+                south_leads_assigned_to_south_tvv += 1
+        self.assertEqual(south_leads_assigned_to_south_tvv, 3)
 
 
 if __name__ == "__main__":

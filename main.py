@@ -9,7 +9,15 @@ from pydantic import BaseModel
 from typing import Optional
 import config
 from lark_client import LarkClient
-from assigner import assign_m0_lead_to_tvv, assign_t0_leads_to_tts, assign_m0_leads_batch, _is_field_empty
+from assigner import (
+    assign_m0_lead_to_tvv,
+    assign_t0_leads_to_tts,
+    assign_m0_leads_batch,
+    assign_facebook_leads_batch,
+    is_eligible_for_distribution,
+    is_eligible_for_facebook,
+    _is_field_empty
+)
 
 def get_resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -91,14 +99,12 @@ def run_m0_sync_process():
         config.validate_config()
         
         # Server-side filter: only filter by M0 status.
-        # Note: checking Person field emptiness (CurrentValue.[field]="") does NOT work
-        # reliably in Lark Bitable formulas, so we only filter by status server-side
-        # and check "Người nhận data" emptiness client-side.
         filter_formula = f'CurrentValue.[{config.FIELD_TIKTOK_STATUS}]="{config.VALUE_TIKTOK_STATUS_M0}"'
         records = lark_client.list_records(config.TABLE_TIKTOK_ID, filter_formula=filter_formula)
         
         # Client-side validation: find M0 leads where either field is empty
-        unassigned_records = []
+        unassigned_tiktok_records = []
+        unassigned_facebook_records = []
         for rec in records:
             fields = rec.get("fields", {})
             status = fields.get(config.FIELD_TIKTOK_STATUS)
@@ -113,18 +119,32 @@ def run_m0_sync_process():
                     f"assigned_raw={assigned_user!r} (empty={assigned_empty})"
                 )
                 if recipient_empty or assigned_empty:
-                    unassigned_records.append(rec)
+                    if is_eligible_for_distribution(fields):
+                        unassigned_tiktok_records.append(rec)
+                    elif is_eligible_for_facebook(fields):
+                        unassigned_facebook_records.append(rec)
                     
-        unassigned_m0_count = 0
-        if unassigned_records:
-            logger.info(f"Sync: Found {len(unassigned_records)} unassigned M0 leads. Distributing in batch...")
-            results = assign_m0_leads_batch(lark_client, unassigned_records)
-            unassigned_m0_count = len(results)
-            logger.info(f"Sync: Successfully assigned {unassigned_m0_count} out of {len(unassigned_records)} leads.")
+        total_assigned_count = 0
+        
+        # Distribute TikTok leads
+        if unassigned_tiktok_records:
+            logger.info(f"Sync: Found {len(unassigned_tiktok_records)} unassigned TikTok M0 leads. Distributing in batch...")
+            results = assign_m0_leads_batch(lark_client, unassigned_tiktok_records)
+            total_assigned_count += len(results)
+            logger.info(f"Sync: Successfully assigned {len(results)} out of {len(unassigned_tiktok_records)} TikTok leads.")
         else:
-            logger.info("Sync: No unassigned M0 leads found.")
+            logger.info("Sync: No unassigned TikTok M0 leads found.")
             
-        return unassigned_m0_count
+        # Distribute Facebook leads
+        if unassigned_facebook_records:
+            logger.info(f"Sync: Found {len(unassigned_facebook_records)} unassigned Facebook M0 leads. Distributing in batch...")
+            results = assign_facebook_leads_batch(lark_client, unassigned_facebook_records)
+            total_assigned_count += len(results)
+            logger.info(f"Sync: Successfully assigned {len(results)} out of {len(unassigned_facebook_records)} Facebook leads.")
+        else:
+            logger.info("Sync: No unassigned Facebook M0 leads found.")
+            
+        return total_assigned_count
     except Exception as e:
         logger.error(f"Error during M0 sync scan: {e}")
         raise e
