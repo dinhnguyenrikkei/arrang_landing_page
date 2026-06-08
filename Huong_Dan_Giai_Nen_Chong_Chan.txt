@@ -1,0 +1,14 @@
+HƯỚNG DẪN CÀI ĐẶT BOT ĐỂ KHÔNG BỊ WINDOWS (SMART APP CONTROL) CHẶN
+
+Tính năng Smart App Control của Windows 11 sẽ chặn toàn bộ các file .exe hoặc .bat tải về từ mạng nếu chưa có chứng chỉ số (chứng chỉ này doanh nghiệp phải mua vài triệu/năm). 
+
+Tuy nhiên, có một thủ thuật rất đơn giản để "lách" tính năng này hoàn toàn miễn phí. Khi bạn gửi file ZIP chứa Bot cho máy khác, hãy yêu cầu họ làm đúng 3 bước sau TRƯỚC KHI GIẢI NÉN:
+
+Bước 1: Tải file ZIP chứa Bot về máy.
+Bước 2: (QUAN TRỌNG NHẤT) Click chuột phải vào file ZIP vừa tải về -> Chọn "Properties" (Thuộc tính).
+Bước 3: Nhìn xuống góc dưới cùng của bảng Properties, bạn sẽ thấy ô vuông ghi "Unblock" (Mở khóa). Hãy tích ✅ vào ô "Unblock" đó, rồi bấm "Apply" và "OK".
+
+*Lưu ý: Nếu không thấy ô Unblock nghĩa là máy đó không bật tính năng chặn, có thể bỏ qua bước này.
+
+Sau khi làm xong 3 bước trên, bạn mới click chuột phải vào file ZIP và chọn "Extract Here" (Giải nén). 
+Bây giờ, file main.exe (hoặc run_bot.bat) bên trong đã được hệ thống coi là file an toàn tự tạo trên máy, và Smart App Control sẽ KHÔNG bao giờ chặn nữa!
