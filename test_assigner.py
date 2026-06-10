@@ -17,6 +17,20 @@ config.DISTRIBUTE_TIKTOK = True
 config.DISTRIBUTE_FACEBOOK = True
 config.DISTRIBUTE_SEEDING = True
 
+# Explicitly set field mapping configs to match the unit test mocks
+config.FIELD_TIKTOK_STATUS = "Trạng thái"
+config.VALUE_TIKTOK_STATUS_M0 = "M0-Data đã claim"
+config.FIELD_TIKTOK_REGION = "Khu vực"
+config.FIELD_TIKTOK_CALLBACK_TIME = "Hẹn gọi lại"
+config.FIELD_TIKTOK_ASSIGNED_USER = "Tư vấn viên"
+config.FIELD_TIKTOK_RECIPIENT_USER = "Người nhận data"
+config.FIELD_TIKTOK_ASSIGNED_TIME = "Thời gian phân phối"
+config.FIELD_TVV_USER = "Nhân sự"
+config.FIELD_TVV_ACTIVE = "Đi làm hôm nay"
+config.FIELD_TVV_REGION = "Team TV"
+config.FIELD_TVV_ROLE = "Hình thức"
+
+
 from assigner import (
     check_tvv_availability,
     assign_m0_lead_to_tvv,
@@ -1190,6 +1204,106 @@ class TestSeedingAndUnifiedDistribution(unittest.TestCase):
         
         selected, _ = select_best_tvv_for_lead("Miền Bắc", 2000000000000, active_tvvs, today_assignments)
         self.assertEqual(selected["user_id"], "user_b")
+
+
+class TestWeightAndLockCases(unittest.TestCase):
+    def test_parse_name_and_weight(self):
+        from assigner import parse_name_and_weight
+        
+        name, weight = parse_name_and_weight("Vũ Ái Vy (50%)")
+        self.assertEqual(name, "Vũ Ái Vy")
+        self.assertAlmostEqual(weight, 0.5)
+        
+        name, weight = parse_name_and_weight("Trần Bách (70%)")
+        self.assertEqual(name, "Trần Bách")
+        self.assertAlmostEqual(weight, 0.7)
+        
+        name, weight = parse_name_and_weight("Lê Lan")
+        self.assertEqual(name, "Lê Lan")
+        self.assertIsNone(weight)
+        
+        name, weight = parse_name_and_weight("Hoàng Nam 100%")
+        self.assertEqual(name, "Hoàng Nam")
+        self.assertAlmostEqual(weight, 1.0)
+
+    def test_fallback_weight_parsing(self):
+        from assigner import fetch_active_agents, tz_vietnam
+        client = MagicMock(spec=LarkClient)
+        
+        # Determine today's date in GMT+7 for active col matching
+        now_vn = datetime.now(tz_vietnam)
+        today_col = now_vn.strftime("%d/%m")
+        
+        tvvs_records = [
+            {
+                "record_id": "rec_1",
+                "fields": {
+                    "Nhân sự": [{"id": "user_1", "name": "Vũ Ái Vy (50%)"}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                    today_col: True,
+                }
+            },
+            {
+                "record_id": "rec_2",
+                "fields": {
+                    "Nhân sự": [{"id": "user_2", "name": "Trần Bách"}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                    today_col: True,
+                    "Ghi chú": "70%"
+                }
+            },
+            {
+                "record_id": "rec_3",
+                "fields": {
+                    "Nhân sự": [{"id": "user_3", "name": "Lê Lan (50%)"}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                    today_col: True,
+                    "Ghi chú": "70%"
+                }
+            }
+        ]
+        client.list_records.return_value = tvvs_records
+        
+        active_agents = fetch_active_agents(client, "TVV")
+        
+        # Verify agents
+        self.assertEqual(len(active_agents), 3)
+        
+        # Vũ Ái Vy: name cleaned to "Vũ Ái Vy", weight fallback to 0.5 from name
+        vy = [a for a in active_agents if a["user_id"] == "user_1"][0]
+        self.assertEqual(vy["name"], "Vũ Ái Vy")
+        self.assertAlmostEqual(vy["weight"], 0.5)
+        
+        # Trần Bách: name "Trần Bách", weight 0.7 from Ghi chú
+        bach = [a for a in active_agents if a["user_id"] == "user_2"][0]
+        self.assertEqual(bach["name"], "Trần Bách")
+        self.assertAlmostEqual(bach["weight"], 0.7)
+        
+        # Lê Lan: name cleaned to "Lê Lan", weight 0.7 from Ghi chú (overrides name weight 0.5)
+        lan = [a for a in active_agents if a["user_id"] == "user_3"][0]
+        self.assertEqual(lan["name"], "Lê Lan")
+        self.assertAlmostEqual(lan["weight"], 0.7)
+
+    def test_sync_lock_concurrency(self):
+        import main
+        from unittest.mock import patch
+        
+        # Ensure lock is not acquired
+        self.assertFalse(main.sync_lock.locked())
+        
+        # Acquire the lock
+        main.sync_lock.acquire()
+        try:
+            # Running sync process while lock is held should return 0 and log a warning
+            with patch('main.logger.info') as mock_info:
+                res = main.run_m0_sync_process()
+                self.assertEqual(res, 0)
+                mock_info.assert_any_call("Sync: Another sync process is already running. Skipping this trigger.")
+        finally:
+            main.sync_lock.release()
 
 
 if __name__ == "__main__":

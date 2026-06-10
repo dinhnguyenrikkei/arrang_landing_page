@@ -103,6 +103,31 @@ def is_eligible_for_seeding(fields: Dict[str, Any]) -> bool:
     
     return source == "Seeding" or channel == "Seeding"
 
+def parse_name_and_weight(name: str) -> Tuple[str, Optional[float]]:
+    """
+    Parses a name and extracts any weight percentage (like '50%' or '(50%)').
+    Returns: (cleaned_name, weight)
+    """
+    if not name:
+        return "", None
+    import re
+    # Match pattern like "(50%)" or "50%" or " ( 50% ) "
+    match = re.search(r'\(\s*(\d+(?:\.\d+)?)\s*%\s*\)', name)
+    if not match:
+        match = re.search(r'(\d+(?:\.\d+)?)\s*%', name)
+        
+    if match:
+        pct = float(match.group(1))
+        weight = max(0.01, min(1.0, pct / 100.0))
+        # Remove the percentage pattern from the name
+        cleaned_name = re.sub(r'\(\s*\d+(?:\.\d+)?\s*%\s*\)', '', name)
+        cleaned_name = re.sub(r'\d+(?:\.\d+)?\s*%', '', cleaned_name)
+        # Clean up double spaces or trailing/leading spaces
+        cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+        return cleaned_name, weight
+        
+    return name.strip(), None
+
 def parse_weight_from_note(note_value: Any) -> float:
     """
     Parse a weight/percentage from the 'Ghi chú' (Notes) column.
@@ -320,8 +345,14 @@ def fetch_active_agents(client: LarkClient, role: str) -> List[Dict[str, Any]]:
             # Parse Personnel field
             person_val = fields.get(personnel_col)
             person_info = parse_personnel_field(person_val)
-            if not person_info and isinstance(person_val, str) and person_val.strip():
+            name_weight = None
+            if person_info:
+                u_id, r_name = person_info
+                cleaned_name, name_weight = parse_name_and_weight(r_name)
+                person_info = (u_id, cleaned_name)
+            elif isinstance(person_val, str) and person_val.strip():
                 # Fallback to name-to-id mapping, fetch user_map lazily if not already loaded
+                cleaned_name, name_weight = parse_name_and_weight(person_val)
                 if user_map is None:
                     try:
                         user_map = client.fetch_all_users()
@@ -329,11 +360,10 @@ def fetch_active_agents(client: LarkClient, role: str) -> List[Dict[str, Any]]:
                     except Exception as e:
                         logger.warning(f"Could not fetch contact users for fallback name mapping: {e}")
                         user_map = {}
-                norm_name = person_val.strip()
-                user_id = user_map.get(norm_name.lower())
+                user_id = user_map.get(cleaned_name.lower())
                 if user_id:
-                    person_info = (user_id, norm_name)
-                    logger.info(f"Resolved personnel '{norm_name}' to User ID '{user_id}' via contact mapping.")
+                    person_info = (user_id, cleaned_name)
+                    logger.info(f"Resolved personnel '{cleaned_name}' to User ID '{user_id}' via contact mapping.")
                 
             if not person_info:
                 logger.warning(f"TVV record {rec.get('record_id')} has no valid personnel account configured in column '{personnel_col}' (value: '{person_val}').")
@@ -354,7 +384,9 @@ def fetch_active_agents(client: LarkClient, role: str) -> List[Dict[str, Any]]:
                 recipient_val = fields.get(recipient_col)
                 recipient_info = parse_personnel_field(recipient_val)
                 if recipient_info:
-                    recipient_user_id = recipient_info[0]
+                    r_user_id, r_name = recipient_info
+                    r_name_cleaned, _ = parse_name_and_weight(r_name)
+                    recipient_user_id = r_user_id
             
             # Extract tvv_link_record_id from "Tư vấn viên" Link column in dispatch table
             tvv_link_record_id = None
@@ -371,11 +403,14 @@ def fetch_active_agents(client: LarkClient, role: str) -> List[Dict[str, Any]]:
                     if rids:
                         tvv_link_record_id = rids[0]
             
-            # Extract weight from "Ghi chú" column
+            # Extract weight from "Ghi chú" column (fallback to weight parsed from name)
             weight = 1.0
             if note_col:
                 note_val = fields.get(note_col)
                 weight = parse_weight_from_note(note_val)
+            
+            if (weight is None or weight == 1.0) and name_weight is not None:
+                weight = name_weight
             
             active_agents.append({
                 "record_id": rec.get("record_id"),
@@ -704,6 +739,9 @@ def build_tvv_name_to_userid_map(client: LarkClient) -> Dict[str, str]:
             if not name:
                 continue
 
+            # Clean name from weight suffixes
+            name, _ = parse_name_and_weight(name)
+
             # If we have user_id from Person field, use it
             if user_id:
                 name_to_userid[name.strip().lower()] = user_id
@@ -714,7 +752,8 @@ def build_tvv_name_to_userid_map(client: LarkClient) -> Dict[str, str]:
                 recipient_val = fields.get(recipient_col)
                 recipient_info = parse_personnel_field(recipient_val)
                 if recipient_info:
-                    r_user_id, _ = recipient_info
+                    r_user_id, r_name = recipient_info
+                    r_name_cleaned, _ = parse_name_and_weight(r_name)
                     name_to_userid[name.strip().lower()] = r_user_id
                     continue
 
@@ -781,6 +820,9 @@ def build_tvv_name_to_link_map(client: LarkClient) -> Dict[str, str]:
             
             if not name:
                 continue
+            
+            # Clean name from weight suffixes
+            name, _ = parse_name_and_weight(name)
             
             # Get link_record_id from TVV link column
             if tvv_link_col:

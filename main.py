@@ -3,6 +3,7 @@ import os
 import sys
 import asyncio
 import collections
+import threading
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -85,20 +86,28 @@ def verify_token(x_webhook_token: str = Header(default=None)):
         logger.warning(f"Unauthorized access attempt with token: {x_webhook_token}")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+# Concurrency lock to serialize sync runs and single-lead assignments
+sync_lock = threading.Lock()
+
 def process_m0_assignment(record_id: str):
     """Background task to process the assignment without blocking HTTP response."""
-    try:
-        config.validate_config()
-        result = assign_m0_lead_to_tvv(lark_client, record_id)
-        if result:
-            logger.info(f"Background task: Lead {record_id} successfully assigned to TVV {result['name']}.")
-        else:
-            logger.warning(f"Background task: Lead {record_id} could not be assigned to any TVV.")
-    except Exception as e:
-        logger.error(f"Background task: Error assigning lead {record_id}: {e}")
+    with sync_lock:
+        try:
+            config.validate_config()
+            result = assign_m0_lead_to_tvv(lark_client, record_id)
+            if result:
+                logger.info(f"Background task: Lead {record_id} successfully assigned to TVV {result['name']}.")
+            else:
+                logger.warning(f"Background task: Lead {record_id} could not be assigned to any TVV.")
+        except Exception as e:
+            logger.error(f"Background task: Error assigning lead {record_id}: {e}")
 
 def run_m0_sync_process():
     """Scan TikTok table for M0 leads and assign any that are unassigned."""
+    acquired = sync_lock.acquire(blocking=False)
+    if not acquired:
+        logger.info("Sync: Another sync process is already running. Skipping this trigger.")
+        return 0
     logger.info("Scanning for unassigned M0 leads to sync...")
     try:
         config.validate_config()
@@ -155,6 +164,8 @@ def run_m0_sync_process():
     except Exception as e:
         logger.error(f"Error during M0 sync scan: {e}")
         raise e
+    finally:
+        sync_lock.release()
 
 async def background_sync_loop():
     """Loop running indefinitely, syncing unassigned M0 leads at a configurable interval."""
