@@ -36,6 +36,9 @@ COOLDOWN_MINUTES_BETWEEN_CALLS = 15
 SYNC_INTERVAL_SECONDS = 60
 PORT = 8000
 BOT_ACTIVE = False
+DISTRIBUTE_TIKTOK = True
+DISTRIBUTE_FACEBOOK = False
+DISTRIBUTE_SEEDING = False
 
 def reload_config(dotenv_path=None):
     """Reload environment variables from .env file and update globals."""
@@ -45,6 +48,7 @@ def reload_config(dotenv_path=None):
     global FIELD_TIKTOK_STATUS, VALUE_TIKTOK_STATUS_M0, FIELD_TIKTOK_REGION, FIELD_TIKTOK_CALLBACK_TIME, FIELD_TIKTOK_ASSIGNED_USER, FIELD_TIKTOK_RECIPIENT_USER, FIELD_TIKTOK_ASSIGNED_TIME
     global FIELD_TVV_USER, FIELD_TVV_ACTIVE, FIELD_TVV_REGION, FIELD_TVV_ROLE
     global MAX_ASSIGNMENTS_PER_DAY, COOLDOWN_MINUTES_BETWEEN_CALLS, SYNC_INTERVAL_SECONDS, PORT, BOT_ACTIVE
+    global DISTRIBUTE_TIKTOK, DISTRIBUTE_FACEBOOK, DISTRIBUTE_SEEDING
 
     if dotenv_path is None:
         dotenv_path = ENV_FILE_PATH
@@ -79,6 +83,9 @@ def reload_config(dotenv_path=None):
     SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "60"))
     PORT = int(os.getenv("PORT", "8000"))
     BOT_ACTIVE = os.getenv("BOT_ACTIVE", "False").lower() in ("true", "1", "yes")
+    DISTRIBUTE_TIKTOK = os.getenv("DISTRIBUTE_TIKTOK", "True").lower() in ("true", "1", "yes")
+    DISTRIBUTE_FACEBOOK = os.getenv("DISTRIBUTE_FACEBOOK", "False").lower() in ("true", "1", "yes")
+    DISTRIBUTE_SEEDING = os.getenv("DISTRIBUTE_SEEDING", "False").lower() in ("true", "1", "yes")
 
 # Initialize variables on load
 reload_config()
@@ -111,6 +118,9 @@ def get_current_env_values() -> dict:
         "SYNC_INTERVAL_SECONDS": "60",
         "PORT": "8000",
         "BOT_ACTIVE": "False",
+        "DISTRIBUTE_TIKTOK": "True",
+        "DISTRIBUTE_FACEBOOK": "False",
+        "DISTRIBUTE_SEEDING": "False",
         "FIELD_TIKTOK_STATUS": "Trạng thái",
         "VALUE_TIKTOK_STATUS_M0": "M0-Data đã claim",
         "FIELD_TIKTOK_REGION": "Khu vực",
@@ -149,6 +159,9 @@ def get_current_env_values() -> dict:
         values["SYNC_INTERVAL_SECONDS"] = str(SYNC_INTERVAL_SECONDS)
         values["PORT"] = str(PORT)
         values["BOT_ACTIVE"] = str(BOT_ACTIVE)
+        values["DISTRIBUTE_TIKTOK"] = "True" if DISTRIBUTE_TIKTOK else "False"
+        values["DISTRIBUTE_FACEBOOK"] = "True" if DISTRIBUTE_FACEBOOK else "False"
+        values["DISTRIBUTE_SEEDING"] = "True" if DISTRIBUTE_SEEDING else "False"
         values["FIELD_TIKTOK_STATUS"] = FIELD_TIKTOK_STATUS
         values["VALUE_TIKTOK_STATUS_M0"] = VALUE_TIKTOK_STATUS_M0
         values["FIELD_TIKTOK_REGION"] = FIELD_TIKTOK_REGION

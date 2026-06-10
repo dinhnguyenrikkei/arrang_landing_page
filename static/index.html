@@ -391,6 +391,15 @@
                 <button id="toggleBotBtn" class="btn-primary" onclick="toggleBot()" style="padding: 0.5rem 1.25rem; font-size: 0.9rem;">Start Bot</button>
             </div>
 
+            <div class="source-control-panel" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--card-border); padding: 1rem; border-radius: 12px; display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 0.5rem;">
+                <div style="font-size: 0.85rem; color: var(--text-secondary); font-weight: 500; letter-spacing: 0.05em;">CẤU HÌNH PHÂN PHỐI NGUỒN M0</div>
+                <div style="display: flex; gap: 0.75rem; justify-content: space-between; flex-wrap: wrap;">
+                    <button id="toggleTiktokBtn" class="btn-secondary" onclick="toggleSource('TIKTOK')" style="flex: 1; min-width: 120px;">Tiktok: OFF</button>
+                    <button id="toggleFacebookBtn" class="btn-secondary" onclick="toggleSource('FACEBOOK')" style="flex: 1; min-width: 120px;">Facebook: OFF</button>
+                    <button id="toggleSeedingBtn" class="btn-secondary" onclick="toggleSource('SEEDING')" style="flex: 1; min-width: 120px;">Seeding: OFF</button>
+                </div>
+            </div>
+
             <div style="display: flex; gap: 1rem;">
                 <button class="btn-secondary" onclick="checkHealth()" style="flex: 1;">Check Connection</button>
                 <button class="btn-primary" onclick="triggerSync()" style="flex: 1;">Sync M0 Now</button>
@@ -466,6 +475,40 @@
             }
         }
 
+        let isTiktokActive = true;
+        let isFacebookActive = false;
+        let isSeedingActive = false;
+
+        function updateSourceUI(tiktok, facebook, seeding) {
+            isTiktokActive = tiktok;
+            isFacebookActive = facebook;
+            isSeedingActive = seeding;
+
+            const tBtn = document.getElementById('toggleTiktokBtn');
+            const fBtn = document.getElementById('toggleFacebookBtn');
+            const sBtn = document.getElementById('toggleSeedingBtn');
+
+            const setBtnState = (btn, active, label) => {
+                if (active) {
+                    btn.innerText = `${label}: ON`;
+                    btn.style.background = 'rgba(16, 185, 129, 0.1)';
+                    btn.style.color = 'var(--accent-success)';
+                    btn.style.border = '1px solid rgba(16, 185, 129, 0.4)';
+                    btn.style.boxShadow = '0 0 10px rgba(16, 185, 129, 0.1)';
+                } else {
+                    btn.innerText = `${label}: OFF`;
+                    btn.style.background = 'rgba(255, 255, 255, 0.02)';
+                    btn.style.color = 'var(--text-secondary)';
+                    btn.style.border = '1px solid var(--card-border)';
+                    btn.style.boxShadow = 'none';
+                }
+            };
+
+            setBtnState(tBtn, isTiktokActive, 'Tiktok');
+            setBtnState(fBtn, isFacebookActive, 'Facebook');
+            setBtnState(sBtn, isSeedingActive, 'Seeding');
+        }
+
         async function fetchConfig() {
             try {
                 const res = await fetch('/api/config');
@@ -476,6 +519,11 @@
                         if (input) input.value = data[key];
                     }
                     updateBotUI(data['BOT_ACTIVE'] === 'True');
+                    updateSourceUI(
+                        data['DISTRIBUTE_TIKTOK'] === 'True',
+                        data['DISTRIBUTE_FACEBOOK'] === 'True',
+                        data['DISTRIBUTE_SEEDING'] === 'True'
+                    );
                     appendLog('Loaded existing configuration.');
                 }
             } catch (err) {
@@ -498,6 +546,9 @@
                 config[k] = el ? el.value : '';
             });
             config['BOT_ACTIVE'] = isBotActive ? 'True' : 'False';
+            config['DISTRIBUTE_TIKTOK'] = isTiktokActive ? 'True' : 'False';
+            config['DISTRIBUTE_FACEBOOK'] = isFacebookActive ? 'True' : 'False';
+            config['DISTRIBUTE_SEEDING'] = isSeedingActive ? 'True' : 'False';
 
             try {
                 const res = await fetch('/api/config', {
@@ -537,6 +588,9 @@
                 config[k] = el ? el.value : '';
             });
             config['BOT_ACTIVE'] = nextState ? 'True' : 'False';
+            config['DISTRIBUTE_TIKTOK'] = isTiktokActive ? 'True' : 'False';
+            config['DISTRIBUTE_FACEBOOK'] = isFacebookActive ? 'True' : 'False';
+            config['DISTRIBUTE_SEEDING'] = isSeedingActive ? 'True' : 'False';
 
             try {
                 const res = await fetch('/api/config', {
@@ -556,6 +610,54 @@
             } catch (err) {
                 showToast('Network error while toggling bot status.', true);
                 appendLog(`Network error during bot toggle: ${err}`, 'error');
+            }
+        }
+
+        async function toggleSource(source) {
+            let config = {};
+            const keys = [
+                'LARK_APP_ID', 'LARK_APP_SECRET', 'LINK_TABLE_TIKTOK', 'LINK_TABLE_TVV',
+                'COOLDOWN_MINUTES_BETWEEN_CALLS', 'SYNC_INTERVAL_SECONDS',
+                'FIELD_TIKTOK_STATUS', 'VALUE_TIKTOK_STATUS_M0', 'FIELD_TIKTOK_REGION',
+                'FIELD_TIKTOK_CALLBACK_TIME', 'FIELD_TIKTOK_ASSIGNED_USER', 'FIELD_TIKTOK_RECIPIENT_USER',
+                'FIELD_TIKTOK_ASSIGNED_TIME', 'FIELD_TVV_USER', 'FIELD_TVV_ACTIVE', 'FIELD_TVV_REGION', 'FIELD_TVV_ROLE'
+            ];
+            keys.forEach(k => {
+                const el = document.getElementById(k);
+                config[k] = el ? el.value : '';
+            });
+            config['BOT_ACTIVE'] = isBotActive ? 'True' : 'False';
+
+            let nextTiktok = isTiktokActive;
+            let nextFacebook = isFacebookActive;
+            let nextSeeding = isSeedingActive;
+
+            if (source === 'TIKTOK') nextTiktok = !isTiktokActive;
+            if (source === 'FACEBOOK') nextFacebook = !isFacebookActive;
+            if (source === 'SEEDING') nextSeeding = !isSeedingActive;
+
+            config['DISTRIBUTE_TIKTOK'] = nextTiktok ? 'True' : 'False';
+            config['DISTRIBUTE_FACEBOOK'] = nextFacebook ? 'True' : 'False';
+            config['DISTRIBUTE_SEEDING'] = nextSeeding ? 'True' : 'False';
+
+            appendLog(`Updating ${source} M0 distribution to ${nextTiktok || nextFacebook || nextSeeding ? 'ON' : 'OFF'}...`, 'info');
+
+            try {
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                if (res.ok) {
+                    updateSourceUI(nextTiktok, nextFacebook, nextSeeding);
+                    showToast(`${source} distribution updated successfully!`);
+                    appendLog(`${source} distribution is now ${nextTiktok || nextFacebook || nextSeeding ? 'ENABLED' : 'DISABLED'}.`);
+                } else {
+                    const errData = await res.json();
+                    showToast(errData.detail || 'Failed to update distribution status.', true);
+                }
+            } catch (err) {
+                showToast('Network error while toggling distribution.', true);
             }
         }
 

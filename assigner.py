@@ -76,6 +76,12 @@ def is_eligible_for_distribution(fields: Dict[str, Any]) -> bool:
     
     return source == "Online - Digital MKT" and channel == "Tiktok"
 
+def is_eligible_for_tiktok(fields: Dict[str, Any]) -> bool:
+    """
+    Check if the lead is eligible for Tiktok distribution.
+    """
+    return is_eligible_for_distribution(fields)
+
 def is_eligible_for_facebook(fields: Dict[str, Any]) -> bool:
     """
     Check if the lead is eligible for Facebook distribution:
@@ -86,6 +92,16 @@ def is_eligible_for_facebook(fields: Dict[str, Any]) -> bool:
     channel = extract_text(fields.get("Kênh đăng ký"))
     
     return source == "Online - Digital MKT" and channel == "Facebook"
+
+def is_eligible_for_seeding(fields: Dict[str, Any]) -> bool:
+    """
+    Check if the lead is eligible for Seeding distribution:
+    - Nguồn Data must be "Seeding" or Kênh đăng ký must be "Seeding"
+    """
+    source = extract_text(fields.get("Nguồn Data"))
+    channel = extract_text(fields.get("Kênh đăng ký"))
+    
+    return source == "Seeding" or channel == "Seeding"
 
 def parse_weight_from_note(note_value: Any) -> float:
     """
@@ -894,251 +910,15 @@ def determine_facebook_target_capacities(
 
 def assign_facebook_leads_batch(client: LarkClient, facebook_leads: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    Distribute Facebook leads using the equal workload distribution algorithm.
+    Distribute Facebook leads using the round-robin/equal-workload algorithm.
     """
-    if not facebook_leads:
-        return []
+    return assign_m0_leads_batch(client, facebook_leads)
 
-    logger.info(f"Starting equal-workload Facebook distribution for {len(facebook_leads)} leads...")
-    
-    current_time_ms = int(time.time() * 1000)
-    records_to_update = []
-    assigned_results = []
-
-    # Get active TVVs
-    active_tvvs = fetch_active_agents(client, "TVV")
-    if not active_tvvs:
-        logger.error("No active TVVs found today. Cannot distribute Facebook leads.")
-        return []
-
-    # Separate Facebook leads into mirror, reverse-mirror, and round-robin
-    mirror_leads = []          # Has TVV, missing recipient
-    reverse_mirror_leads = []  # Has recipient, missing TVV
-    roundrobin_leads = []      # Missing both
-
-    tvv_name_map = None
-
-    for lead in facebook_leads:
-        fields = lead.get("fields", {})
-        
-        tvv_field_value = fields.get(config.FIELD_TIKTOK_ASSIGNED_USER)
-        recipient_field_value = fields.get(config.FIELD_TIKTOK_RECIPIENT_USER)
-        
-        tvv_empty = _is_field_empty(tvv_field_value)
-        recipient_empty = _is_field_empty(recipient_field_value)
-        
-        if not tvv_empty and recipient_empty:
-            tvv_name = extract_tvv_name_from_field(tvv_field_value)
-            if tvv_name:
-                mirror_leads.append((lead, tvv_name))
-            else:
-                roundrobin_leads.append(lead)
-        elif tvv_empty and not recipient_empty:
-            reverse_mirror_leads.append(lead)
-        elif tvv_empty and recipient_empty:
-            roundrobin_leads.append(lead)
-
-    logger.info(f"Facebook Leads: mirror={len(mirror_leads)}, reverse-mirror={len(reverse_mirror_leads)}, "
-                f"round-robin={len(roundrobin_leads)}")
-
-    # 1. Process Mirror Leads
-    for lead, tvv_name in mirror_leads:
-        lead_record_id = lead.get("record_id")
-        selected = None
-        for tvv in active_tvvs:
-            if tvv["name"].strip().lower() == tvv_name.strip().lower():
-                selected = tvv
-                break
-        
-        if selected:
-            recipient_uid = selected.get("recipient_user_id") or selected["user_id"]
-            update_fields = {
-                config.FIELD_TIKTOK_RECIPIENT_USER: [{"id": recipient_uid}],
-                config.FIELD_TIKTOK_ASSIGNED_TIME: current_time_ms,
-            }
-            records_to_update.append({
-                "record_id": lead_record_id,
-                "fields": update_fields
-            })
-            assigned_results.append((lead_record_id, {"name": selected["name"], "user_id": recipient_uid}))
-            logger.info(f"Facebook Mirror: Lead {lead_record_id} → {selected['name']}")
-
-    # 2. Process Reverse-Mirror Leads
-    if reverse_mirror_leads:
-        for lead in reverse_mirror_leads:
-            lead_record_id = lead.get("record_id")
-            fields = lead.get("fields", {})
-            recipient_value = fields.get(config.FIELD_TIKTOK_RECIPIENT_USER)
-            person_info = parse_personnel_field(recipient_value)
-            
-            if not person_info:
-                continue
-            user_id, person_name = person_info
-            if not person_name:
-                continue
-            
-            field_type = client.get_field_type(config.TABLE_TIKTOK_ID, config.FIELD_TIKTOK_ASSIGNED_USER)
-            if field_type == 11:
-                update_fields = {
-                    config.FIELD_TIKTOK_ASSIGNED_USER: [{"id": user_id}],
-                    config.FIELD_TIKTOK_ASSIGNED_TIME: current_time_ms,
-                }
-                records_to_update.append({"record_id": lead_record_id, "fields": update_fields})
-                assigned_results.append((lead_record_id, {"name": person_name, "user_id": user_id}))
-            elif field_type == 21:
-                if tvv_name_map is None:
-                    tvv_name_map = build_tvv_name_to_link_map(client)
-                link_rid = tvv_name_map.get(person_name.strip().lower())
-                if link_rid:
-                    update_fields = {
-                        config.FIELD_TIKTOK_ASSIGNED_USER: [link_rid],
-                        config.FIELD_TIKTOK_ASSIGNED_TIME: current_time_ms,
-                    }
-                    records_to_update.append({"record_id": lead_record_id, "fields": update_fields})
-                    assigned_results.append((lead_record_id, {"name": person_name, "user_id": user_id}))
-
-    # 3. Process Round-Robin/Equal-workload leads
-    if roundrobin_leads:
-        today_facebook_assignments = fetch_today_facebook_assignments(client)
-        target_new_caps = determine_facebook_target_capacities(
-            active_tvvs, roundrobin_leads, today_facebook_assignments
-        )
-        
-        logger.info(f"Facebook target new assignment caps per TVV: {target_new_caps}")
-
-        # Keep track of assigned counts for this batch
-        batch_assigned_counts = {
-            tvv.get("recipient_user_id") or tvv["user_id"]: 0
-            for tvv in active_tvvs
-        }
-
-        # Pass 1: Same region assignment
-        unassigned_leads = []
-        for lead in roundrobin_leads:
-            lead_record_id = lead.get("record_id")
-            fields = lead.get("fields", {})
-            lead_region = normalize_region(fields.get(config.FIELD_TIKTOK_REGION, ""))
-            
-            # Find TVVs in the same region
-            candidates = [
-                tvv for tvv in active_tvvs
-                if tvv["region"] == lead_region
-            ]
-            
-            # Filter candidates to only those who haven't reached their target new capacity
-            available_candidates = []
-            for tvv in candidates:
-                uid = tvv.get("recipient_user_id") or tvv["user_id"]
-                if batch_assigned_counts[uid] < target_new_caps.get(uid, 0):
-                    available_candidates.append(tvv)
-            
-            if available_candidates:
-                available_candidates.sort(
-                    key=lambda t: (
-                        batch_assigned_counts[t.get("recipient_user_id") or t["user_id"]],
-                        t["name"]
-                    )
-                )
-                selected_tvv = available_candidates[0]
-                uid = selected_tvv.get("recipient_user_id") or selected_tvv["user_id"]
-                batch_assigned_counts[uid] += 1
-                
-                update_fields = {
-                    config.FIELD_TIKTOK_RECIPIENT_USER: [{"id": uid}],
-                    config.FIELD_TIKTOK_ASSIGNED_TIME: current_time_ms,
-                }
-                
-                field_type = client.get_field_type(config.TABLE_TIKTOK_ID, config.FIELD_TIKTOK_ASSIGNED_USER)
-                if field_type == 21:
-                    linked_record_id = selected_tvv.get("tvv_link_record_id")
-                    if linked_record_id:
-                        update_fields[config.FIELD_TIKTOK_ASSIGNED_USER] = [linked_record_id]
-                elif field_type == 11 or field_type is None:
-                    update_fields[config.FIELD_TIKTOK_ASSIGNED_USER] = [{"id": uid}]
-                
-                records_to_update.append({
-                    "record_id": lead_record_id,
-                    "fields": update_fields
-                })
-                assigned_results.append((lead_record_id, selected_tvv))
-                logger.info(f"Facebook same-region: Lead {lead_record_id} → {selected_tvv['name']} ({lead_region})")
-            else:
-                unassigned_leads.append(lead)
-
-        # Pass 2: Overflow / remaining assignments
-        if unassigned_leads:
-            logger.info(f"Facebook Pass 2 (overflow) for {len(unassigned_leads)} leads...")
-            for lead in unassigned_leads:
-                lead_record_id = lead.get("record_id")
-                
-                available_candidates = []
-                for tvv in active_tvvs:
-                    uid = tvv.get("recipient_user_id") or tvv["user_id"]
-                    if batch_assigned_counts[uid] < target_new_caps.get(uid, 0):
-                        available_candidates.append(tvv)
-                
-                if available_candidates:
-                    available_candidates.sort(
-                        key=lambda t: (
-                            batch_assigned_counts[t.get("recipient_user_id") or t["user_id"]],
-                            t["name"]
-                        )
-                    )
-                    selected_tvv = available_candidates[0]
-                    uid = selected_tvv.get("recipient_user_id") or selected_tvv["user_id"]
-                    batch_assigned_counts[uid] += 1
-                    
-                    update_fields = {
-                        config.FIELD_TIKTOK_RECIPIENT_USER: [{"id": uid}],
-                        config.FIELD_TIKTOK_ASSIGNED_TIME: current_time_ms,
-                    }
-                    
-                    field_type = client.get_field_type(config.TABLE_TIKTOK_ID, config.FIELD_TIKTOK_ASSIGNED_USER)
-                    if field_type == 21:
-                        linked_record_id = selected_tvv.get("tvv_link_record_id")
-                        if linked_record_id:
-                            update_fields[config.FIELD_TIKTOK_ASSIGNED_USER] = [linked_record_id]
-                    elif field_type == 11 or field_type is None:
-                        update_fields[config.FIELD_TIKTOK_ASSIGNED_USER] = [{"id": uid}]
-                    
-                    records_to_update.append({
-                        "record_id": lead_record_id,
-                        "fields": update_fields
-                    })
-                    assigned_results.append((lead_record_id, selected_tvv))
-                    logger.info(f"Facebook overflow: Lead {lead_record_id} → {selected_tvv['name']}")
-                else:
-                    logger.error(f"No TVV with capacity left for Facebook lead {lead_record_id}")
-
-    # Write updates to Lark Bitable
-    if records_to_update:
-        logger.info(f"Updating {len(records_to_update)} Facebook records in Lark...")
-        try:
-            client.batch_update_records(config.TABLE_TIKTOK_ID, records_to_update)
-            logger.info("Successfully updated batch Facebook records.")
-        except Exception as e:
-            is_perm_err = False
-            err_str = str(e)
-            if "403" in err_str or "Permission denied" in err_str or "1254302" in err_str:
-                is_perm_err = True
-                
-            if is_perm_err:
-                logger.warning("Facebook batch update permission error, attempting fallback update...")
-                fallback_records = []
-                for rec in records_to_update:
-                    f_fields = rec.get("fields", {}).copy()
-                    if config.FIELD_TIKTOK_ASSIGNED_USER in f_fields:
-                        del f_fields[config.FIELD_TIKTOK_ASSIGNED_USER]
-                    fallback_records.append({
-                        "record_id": rec["record_id"],
-                        "fields": f_fields
-                    })
-                client.batch_update_records(config.TABLE_TIKTOK_ID, fallback_records)
-                logger.info("Successfully completed fallback update for Facebook.")
-            else:
-                raise e
-
-    return assigned_results
+def assign_seeding_leads_batch(client: LarkClient, seeding_leads: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    """
+    Distribute Seeding leads using the round-robin/equal-workload algorithm.
+    """
+    return assign_m0_leads_batch(client, seeding_leads)
 
 
 def assign_m0_lead_to_tvv(client: LarkClient, lead_record_id: str) -> Optional[Dict[str, Any]]:
@@ -1160,14 +940,22 @@ def assign_m0_lead_to_tvv(client: LarkClient, lead_record_id: str) -> Optional[D
     fields = lead.get("fields", {})
     
     # Check source and channel eligibility (only distribute Online - Digital MKT & Tiktok)
-    if not is_eligible_for_distribution(fields):
-        if is_eligible_for_facebook(fields):
-            logger.info(f"Lead {lead_record_id} is a Facebook lead. Routing to Facebook distributor...")
-            results = assign_facebook_leads_batch(client, [lead])
-            if results:
-                return results[0][1]
-            return None
-        logger.info(f"Lead {lead_record_id} does not match Nguồn Data='Online - Digital MKT' and Kênh đăng ký='Tiktok'. Skipping.")
+    is_tiktok = is_eligible_for_tiktok(fields)
+    is_fb = is_eligible_for_facebook(fields)
+    is_seeding = is_eligible_for_seeding(fields)
+    
+    if not (is_tiktok or is_fb or is_seeding):
+        logger.info(f"Lead {lead_record_id} does not match any eligible sources. Skipping.")
+        return None
+        
+    if is_tiktok and not config.DISTRIBUTE_TIKTOK:
+        logger.info(f"Lead {lead_record_id} is Tiktok but Tiktok distribution is disabled. Skipping.")
+        return None
+    if is_fb and not config.DISTRIBUTE_FACEBOOK:
+        logger.info(f"Lead {lead_record_id} is Facebook but Facebook distribution is disabled. Skipping.")
+        return None
+    if is_seeding and not config.DISTRIBUTE_SEEDING:
+        logger.info(f"Lead {lead_record_id} is Seeding but Seeding distribution is disabled. Skipping.")
         return None
         
     status = fields.get(config.FIELD_TIKTOK_STATUS)
@@ -1500,8 +1288,22 @@ def assign_m0_leads_batch(client: LarkClient, lead_records: List[Dict[str, Any]]
         fields = lead.get("fields", {})
         
         # Check source and channel eligibility (only distribute Online - Digital MKT & Tiktok)
-        if not is_eligible_for_distribution(fields):
-            logger.info(f"Batch: Lead {lead.get('record_id')} does not match Nguồn Data='Online - Digital MKT' and Kênh đăng ký='Tiktok'. Skipping.")
+        is_tiktok = is_eligible_for_tiktok(fields)
+        is_fb = is_eligible_for_facebook(fields)
+        is_seeding = is_eligible_for_seeding(fields)
+        
+        if not (is_tiktok or is_fb or is_seeding):
+            logger.info(f"Batch: Lead {lead.get('record_id')} does not match any eligible sources. Skipping.")
+            continue
+            
+        if is_tiktok and not config.DISTRIBUTE_TIKTOK:
+            logger.info(f"Batch: Lead {lead.get('record_id')} is Tiktok but Tiktok distribution is disabled. Skipping.")
+            continue
+        if is_fb and not config.DISTRIBUTE_FACEBOOK:
+            logger.info(f"Batch: Lead {lead.get('record_id')} is Facebook but Facebook distribution is disabled. Skipping.")
+            continue
+        if is_seeding and not config.DISTRIBUTE_SEEDING:
+            logger.info(f"Batch: Lead {lead.get('record_id')} is Seeding but Seeding distribution is disabled. Skipping.")
             continue
             
         tvv_field_value = fields.get(config.FIELD_TIKTOK_ASSIGNED_USER)

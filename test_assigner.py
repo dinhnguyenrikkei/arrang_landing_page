@@ -13,6 +13,9 @@ config.TABLE_TIKTOK_ID = "test_tiktok_table"
 config.TABLE_TVV_ID = "test_tvv_table"
 config.MAX_ASSIGNMENTS_PER_DAY = 2
 config.COOLDOWN_MINUTES_BETWEEN_CALLS = 15
+config.DISTRIBUTE_TIKTOK = True
+config.DISTRIBUTE_FACEBOOK = True
+config.DISTRIBUTE_SEEDING = True
 
 from assigner import (
     check_tvv_availability,
@@ -1040,30 +1043,6 @@ class TestFacebookDistribution(unittest.TestCase):
         self.client = MagicMock(spec=LarkClient)
         self.client.get_field_type.return_value = 11
 
-    def test_determine_facebook_target_capacities_basic(self):
-        from assigner import determine_facebook_target_capacities
-        active_tvvs = [
-            {"user_id": "user_n", "recipient_user_id": "user_n", "name": "North TVV", "region": "Miền Bắc"},
-            {"user_id": "user_s", "recipient_user_id": "user_s", "name": "South TVV", "region": "Miền Nam"}
-        ]
-        
-        # Scenario: 10 North leads, 3 South leads. (Total 13 leads)
-        new_leads = [
-            {"record_id": f"l_n_{i}", "fields": {"Khu vực": "Miền Bắc", "Nguồn Data": "Online - Digital MKT", "Kênh đăng ký": "Facebook"}}
-            for i in range(10)
-        ] + [
-            {"record_id": f"l_s_{i}", "fields": {"Khu vực": "Miền Nam", "Nguồn Data": "Online - Digital MKT", "Kênh đăng ký": "Facebook"}}
-            for i in range(3)
-        ]
-        
-        today_assignments = []
-        
-        target_caps = determine_facebook_target_capacities(active_tvvs, new_leads, today_assignments)
-        
-        # Expected: North TVV (10 same region leads) gets target count 7. South TVV (3 same region) gets 6.
-        self.assertEqual(target_caps["user_n"], 7)
-        self.assertEqual(target_caps["user_s"], 6)
-
     def test_assign_facebook_leads_batch_distribution(self):
         from assigner import assign_facebook_leads_batch, tz_vietnam
         tvvs_records = [
@@ -1107,6 +1086,12 @@ class TestFacebookDistribution(unittest.TestCase):
             } for i in range(3)
         ]
         
+        # Determine today's date in GMT+7 for active col matching
+        now_vn = datetime.now(tz_vietnam)
+        today_col = now_vn.strftime("%d/%m")
+        for tvv in tvvs_records:
+            tvv["fields"][today_col] = True
+        
         def mock_list_records(table_id, **kwargs):
             if table_id == config.TABLE_TVV_ID:
                 return tvvs_records
@@ -1125,14 +1110,86 @@ class TestFacebookDistribution(unittest.TestCase):
         north_tvv_assignments = [r for r in results if r[1]["user_id"] == "user_n"]
         south_tvv_assignments = [r for r in results if r[1]["user_id"] == "user_s"]
         
-        self.assertEqual(len(north_tvv_assignments), 7)
-        self.assertEqual(len(south_tvv_assignments), 6)
+        # With round-robin + cooldown:
+        # Lead North 0 -> user_n (free)
+        # Lead North 1 -> user_s (other region free)
+        # Leads North 2-9 -> user_n (fallback same region, both busy)
+        # Leads South 0-2 -> user_s (fallback same region, both busy)
+        self.assertEqual(len(north_tvv_assignments), 9)
+        self.assertEqual(len(south_tvv_assignments), 4)
+
+
+class TestSeedingAndUnifiedDistribution(unittest.TestCase):
+    def setUp(self):
+        self.client = MagicMock(spec=LarkClient)
+        self.client.get_field_type.return_value = 11
+
+    def test_is_eligible_for_seeding(self):
+        from assigner import is_eligible_for_seeding
+        self.assertTrue(is_eligible_for_seeding({"Nguồn Data": "Seeding", "Kênh đăng ký": "Other"}))
+        self.assertTrue(is_eligible_for_seeding({"Nguồn Data": "Other", "Kênh đăng ký": "Seeding"}))
+        self.assertFalse(is_eligible_for_seeding({"Nguồn Data": "Tiktok", "Kênh đăng ký": "Tiktok"}))
+
+    def test_seeding_leads_batch_distribution(self):
+        from assigner import assign_seeding_leads_batch, tz_vietnam
+        tvvs_records = [
+            {
+                "record_id": "rec_s",
+                "fields": {
+                    "Nhân sự": [{"id": "user_s", "name": "South TVV"}],
+                    "Team TV": "Miền Nam",
+                    "Đi làm hôm nay": True,
+                }
+            }
+        ]
         
-        south_leads_assigned_to_south_tvv = 0
-        for rid, tvv in south_tvv_assignments:
-            if "south" in rid:
-                south_leads_assigned_to_south_tvv += 1
-        self.assertEqual(south_leads_assigned_to_south_tvv, 3)
+        leads = [
+            {
+                "record_id": "lead_seeding_1",
+                "fields": {
+                    "Khu vực": "Miền Nam",
+                    "Nguồn Data": "Seeding",
+                    "Trạng thái": "M0-Data đã claim"
+                }
+            }
+        ]
+        
+        now_vn = datetime.now(tz_vietnam)
+        today_col = now_vn.strftime("%d/%m")
+        for tvv in tvvs_records:
+            tvv["fields"][today_col] = True
+
+        def mock_list_records(table_id, **kwargs):
+            if table_id == config.TABLE_TVV_ID:
+                return tvvs_records
+            elif table_id == config.TABLE_TIKTOK_ID:
+                return []
+            return []
+            
+        self.client.list_records.side_effect = mock_list_records
+        
+        results = assign_seeding_leads_batch(self.client, leads)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][1]["user_id"], "user_s")
+
+    def test_unified_workload_fairness_tiktok_considers_other_sources(self):
+        from assigner import select_best_tvv_for_lead
+        
+        # TVV A (North) and TVV B (North)
+        active_tvvs = [
+            {"user_id": "user_a", "recipient_user_id": "user_a", "name": "A", "region": "Miền Bắc", "weight": 1.0},
+            {"user_id": "user_b", "recipient_user_id": "user_b", "name": "B", "region": "Miền Bắc", "weight": 1.0},
+        ]
+        
+        # Today's assignments: TVV A has 1 assignment (from Facebook or Seeding, doesn't matter, it's in today_assignments)
+        # TVV B has 0 assignments
+        # So TVV B should be preferred (round-robin)
+        today_assignments = [
+            {"assigned_user_id": "user_a", "assigned_time": 1000, "callback_time": 10000}
+        ]
+        
+        selected, _ = select_best_tvv_for_lead("Miền Bắc", 2000000000000, active_tvvs, today_assignments)
+        self.assertEqual(selected["user_id"], "user_b")
 
 
 if __name__ == "__main__":

@@ -14,8 +14,10 @@ from assigner import (
     assign_t0_leads_to_tts,
     assign_m0_leads_batch,
     assign_facebook_leads_batch,
+    assign_seeding_leads_batch,
     is_eligible_for_distribution,
     is_eligible_for_facebook,
+    is_eligible_for_seeding,
     _is_field_empty
 )
 
@@ -73,6 +75,9 @@ class ConfigPayload(BaseModel):
     FIELD_TVV_ACTIVE: Optional[str] = None
     FIELD_TVV_REGION: Optional[str] = None
     FIELD_TVV_ROLE: Optional[str] = None
+    DISTRIBUTE_TIKTOK: Optional[str] = None
+    DISTRIBUTE_FACEBOOK: Optional[str] = None
+    DISTRIBUTE_SEEDING: Optional[str] = None
 
 def verify_token(x_webhook_token: str = Header(default=None)):
     """Optional token verification for security."""
@@ -103,8 +108,10 @@ def run_m0_sync_process():
         records = lark_client.list_records(config.TABLE_TIKTOK_ID, filter_formula=filter_formula)
         
         # Client-side validation: find M0 leads where either field is empty
-        unassigned_tiktok_records = []
-        unassigned_facebook_records = []
+        eligible_leads = []
+        tiktok_count = 0
+        facebook_count = 0
+        seeding_count = 0
         for rec in records:
             fields = rec.get("fields", {})
             status = fields.get(config.FIELD_TIKTOK_STATUS)
@@ -119,30 +126,30 @@ def run_m0_sync_process():
                     f"assigned_raw={assigned_user!r} (empty={assigned_empty})"
                 )
                 if recipient_empty or assigned_empty:
-                    if is_eligible_for_distribution(fields):
-                        unassigned_tiktok_records.append(rec)
-                    elif is_eligible_for_facebook(fields):
-                        unassigned_facebook_records.append(rec)
+                    if is_eligible_for_distribution(fields) and config.DISTRIBUTE_TIKTOK:
+                        eligible_leads.append(rec)
+                        tiktok_count += 1
+                    elif is_eligible_for_facebook(fields) and config.DISTRIBUTE_FACEBOOK:
+                        eligible_leads.append(rec)
+                        facebook_count += 1
+                    elif is_eligible_for_seeding(fields) and config.DISTRIBUTE_SEEDING:
+                        eligible_leads.append(rec)
+                        seeding_count += 1
                     
         total_assigned_count = 0
         
-        # Distribute TikTok leads
-        if unassigned_tiktok_records:
-            logger.info(f"Sync: Found {len(unassigned_tiktok_records)} unassigned TikTok M0 leads. Distributing in batch...")
-            results = assign_m0_leads_batch(lark_client, unassigned_tiktok_records)
-            total_assigned_count += len(results)
-            logger.info(f"Sync: Successfully assigned {len(results)} out of {len(unassigned_tiktok_records)} TikTok leads.")
+        # Distribute eligible leads in a single combined batch
+        if eligible_leads:
+            logger.info(
+                f"Sync: Found {len(eligible_leads)} unassigned M0 leads to distribute "
+                f"(TikTok: {tiktok_count}, Facebook: {facebook_count}, Seeding: {seeding_count}). "
+                f"Distributing in batch..."
+            )
+            results = assign_m0_leads_batch(lark_client, eligible_leads)
+            total_assigned_count = len(results)
+            logger.info(f"Sync: Successfully assigned {total_assigned_count} out of {len(eligible_leads)} leads.")
         else:
-            logger.info("Sync: No unassigned TikTok M0 leads found.")
-            
-        # Distribute Facebook leads
-        if unassigned_facebook_records:
-            logger.info(f"Sync: Found {len(unassigned_facebook_records)} unassigned Facebook M0 leads. Distributing in batch...")
-            results = assign_facebook_leads_batch(lark_client, unassigned_facebook_records)
-            total_assigned_count += len(results)
-            logger.info(f"Sync: Successfully assigned {len(results)} out of {len(unassigned_facebook_records)} Facebook leads.")
-        else:
-            logger.info("Sync: No unassigned Facebook M0 leads found.")
+            logger.info("Sync: No unassigned eligible M0 leads found.")
             
         return total_assigned_count
     except Exception as e:
