@@ -266,6 +266,164 @@ class TestLeadAssignment(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertEqual(selected["user_id"], "user_s1")  # Should overflow to South TVV (user_s1)
 
+    def test_assign_m0_lead_to_tvv_south_strict_no_overflow_fallback_to_busy_south(self):
+        """Scenario: South lead, South TVV is busy, North TVV is free. Should NOT overflow to North, but fallback to busy South."""
+        start_ms, _ = get_today_range()
+        lead_id = "lead_south_clash"
+        lead_record = {
+            "record_id": lead_id,
+            "fields": {
+                config.FIELD_TIKTOK_STATUS: "M0",
+                config.FIELD_TIKTOK_REGION: "Miền Nam",
+                config.FIELD_TIKTOK_CALLBACK_TIME: start_ms + 10000
+            }
+        }
+        self.client.get_record.return_value = lead_record
+        
+        tvvs_records = [
+            {
+                "record_id": "rec_tvv_south",
+                "fields": {
+                    config.FIELD_TVV_ROLE: "TVV",
+                    config.FIELD_TVV_ACTIVE: True,
+                    config.FIELD_TVV_REGION: "Miền Nam",
+                    config.FIELD_TVV_USER: [{"id": "user_s1", "name": "South 1"}]
+                }
+            },
+            {
+                "record_id": "rec_tvv_north",
+                "fields": {
+                    config.FIELD_TVV_ROLE: "TVV",
+                    config.FIELD_TVV_ACTIVE: True,
+                    config.FIELD_TVV_REGION: "Miền Bắc",
+                    config.FIELD_TVV_USER: [{"id": "user_n1", "name": "North 1"}]
+                }
+            }
+        ]
+        
+        # Mock today's assignments: South 1 has conflicting call
+        today_assignments_records = [
+            {
+                "record_id": "l1",
+                "fields": {
+                    config.FIELD_TIKTOK_ASSIGNED_USER: [{"id": "user_s1"}],
+                    config.FIELD_TIKTOK_ASSIGNED_TIME: start_ms + 5000,
+                    config.FIELD_TIKTOK_CALLBACK_TIME: start_ms + 10000
+                }
+            }
+        ]
+        
+        def mock_list_records(table_id, **kwargs):
+            if table_id == config.TABLE_TVV_ID:
+                return tvvs_records
+            elif table_id == config.TABLE_TIKTOK_ID:
+                return today_assignments_records
+            return []
+            
+        self.client.list_records.side_effect = mock_list_records
+        
+        # Act
+        selected = assign_m0_lead_to_tvv(self.client, lead_id)
+        
+        # Assert
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["user_id"], "user_s1")  # strict: must not pick free user_n1, falls back to busy user_s1
+
+    def test_assign_m0_lead_to_tvv_south_strict_fallback_to_inactive_south_agents(self):
+        """Scenario: South lead, only North TVV is active, but South TVV is inactive. Should fallback and assign to inactive South TVV."""
+        start_ms, _ = get_today_range()
+        lead_id = "lead_south_inactive_agent"
+        lead_record = {
+            "record_id": lead_id,
+            "fields": {
+                config.FIELD_TIKTOK_STATUS: "M0",
+                config.FIELD_TIKTOK_REGION: "Miền Nam",
+                config.FIELD_TIKTOK_CALLBACK_TIME: start_ms + 10000
+            }
+        }
+        self.client.get_record.return_value = lead_record
+        
+        # Dispatch table records:
+        # TVV North is active.
+        # TVV South is INACTIVE (not active today).
+        tvvs_records = [
+            {
+                "record_id": "rec_tvv_north",
+                "fields": {
+                    config.FIELD_TVV_ROLE: "TVV",
+                    config.FIELD_TVV_ACTIVE: True,
+                    config.FIELD_TVV_REGION: "Miền Bắc",
+                    config.FIELD_TVV_USER: [{"id": "user_n1", "name": "North 1"}]
+                }
+            },
+            {
+                "record_id": "rec_tvv_south",
+                "fields": {
+                    config.FIELD_TVV_ROLE: "TVV",
+                    config.FIELD_TVV_ACTIVE: False, # Inactive!
+                    config.FIELD_TVV_REGION: "Miền Nam",
+                    config.FIELD_TVV_USER: [{"id": "user_s1", "name": "South 1"}]
+                }
+            }
+        ]
+        
+        def mock_list_records(table_id, **kwargs):
+            if table_id == config.TABLE_TVV_ID:
+                return tvvs_records
+            elif table_id == config.TABLE_TIKTOK_ID:
+                return []
+            return []
+            
+        self.client.list_records.side_effect = mock_list_records
+        
+        # Act
+        selected = assign_m0_lead_to_tvv(self.client, lead_id)
+        
+        # Assert
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["user_id"], "user_s1")  # strict fallback: must assign to inactive South TVV (user_s1) instead of active North TVV
+
+    def test_assign_m0_lead_to_tvv_south_strict_none_if_no_south_agents_exist_at_all(self):
+        """Scenario: South lead, only North TVV exists in the entire system. Should return None."""
+        start_ms, _ = get_today_range()
+        lead_id = "lead_south_no_south_agent_at_all"
+        lead_record = {
+            "record_id": lead_id,
+            "fields": {
+                config.FIELD_TIKTOK_STATUS: "M0",
+                config.FIELD_TIKTOK_REGION: "Miền Nam",
+                config.FIELD_TIKTOK_CALLBACK_TIME: start_ms + 10000
+            }
+        }
+        self.client.get_record.return_value = lead_record
+        
+        tvvs_records = [
+            {
+                "record_id": "rec_tvv_north",
+                "fields": {
+                    config.FIELD_TVV_ROLE: "TVV",
+                    config.FIELD_TVV_ACTIVE: True,
+                    config.FIELD_TVV_REGION: "Miền Bắc",
+                    config.FIELD_TVV_USER: [{"id": "user_n1", "name": "North 1"}]
+                }
+            }
+        ]
+        
+        def mock_list_records(table_id, **kwargs):
+            if table_id == config.TABLE_TVV_ID:
+                return tvvs_records
+            elif table_id == config.TABLE_TIKTOK_ID:
+                return []
+            return []
+            
+        self.client.list_records.side_effect = mock_list_records
+        
+        # Act
+        selected = assign_m0_lead_to_tvv(self.client, lead_id)
+        
+        # Assert
+        self.assertIsNone(selected)
+
     def test_assign_t0_leads_to_tts(self):
         """Test that daily T0 lead distribution to active TTS is disabled and returns 0."""
         # Act

@@ -14,7 +14,48 @@ class LarkClient:
         self._token_expires_at: float = 0.0
         self._user_map_cache: Optional[Dict[str, str]] = None
         self._user_map_cache_expires_at: float = 0.0
-        self._fields_cache: Dict[str, tuple] = {}  # table_id -> (expires_at, fields_list)
+        self._fields_cache = {}  # table_id -> (expires_at, fields_list)
+
+    def _send_request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """
+        Send HTTP request with automatic retry logic for rate limiting (429) and network glitches.
+        """
+        max_retries = 3
+        backoff_factor = 2
+        timeout = kwargs.pop("timeout", 45)  # Default timeout 45 seconds
+        
+        # Avoid infinite recursion: get_token calls _send_request
+        if "headers" not in kwargs and "/auth/v3/tenant_access_token/internal" not in url:
+            kwargs["headers"] = self.get_headers()
+            
+        for attempt in range(max_retries):
+            try:
+                response = requests.request(method, url, timeout=timeout, **kwargs)
+                
+                # Rate limit 429
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", 2))
+                    logger.warning(f"Lark API Rate Limit (429) hit. Retrying after {retry_after}s (Attempt {attempt+1}/{max_retries})...")
+                    time.sleep(retry_after)
+                    continue
+                    
+                # Temporary server errors (502, 503, 504)
+                if response.status_code in [502, 503, 504]:
+                    sleep_time = backoff_factor ** attempt
+                    logger.warning(f"Lark API Server Error ({response.status_code}). Retrying after {sleep_time}s (Attempt {attempt+1}/{max_retries})...")
+                    time.sleep(sleep_time)
+                    continue
+                    
+                return response
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                sleep_time = backoff_factor ** attempt
+                logger.warning(f"Network error ({e}). Retrying after {sleep_time}s (Attempt {attempt+1}/{max_retries})...")
+                time.sleep(sleep_time)
+                if attempt == max_retries - 1:
+                    raise e
+                    
+        # Final attempt
+        return requests.request(method, url, timeout=timeout, **kwargs)
 
     @property
     def app_id(self) -> str:
@@ -45,7 +86,7 @@ class LarkClient:
         
         try:
             logger.info("Requesting new tenant_access_token...")
-            response = requests.post(url, json=payload, timeout=30)
+            response = self._send_request("POST", url, json=payload, timeout=30)
             response.raise_for_status()
             data = response.json()
             
@@ -105,7 +146,7 @@ class LarkClient:
                 # If we have a filter, we can pass it as a JSON payload or in the query.
                 # Actually, standard GET request doesn't take a JSON body, but Lark's API accepts filter parameter.
                 # If we need complex filtering, we will do it in-memory to prevent complex URL encoding and API mismatches.
-                response = requests.get(url, headers=headers, params=params, timeout=30)
+                response = self._send_request("GET", url, headers=headers, params=params)
                 if response.status_code != 200:
                     logger.error(f"HTTP Status {response.status_code} listing records from Lark: {response.text}")
                 response.raise_for_status()
@@ -137,7 +178,7 @@ class LarkClient:
         headers = self.get_headers()
         try:
             logger.info(f"Fetching record {record_id} from table {table_id}...")
-            response = requests.get(url, headers=headers, timeout=30)
+            response = self._send_request("GET", url, headers=headers)
             response.raise_for_status()
             data = response.json()
             if data.get("code") == 0:
@@ -159,7 +200,7 @@ class LarkClient:
         
         try:
             logger.info(f"Updating record {record_id} in table {table_id}...")
-            response = requests.put(url, headers=headers, json=payload, timeout=30)
+            response = self._send_request("PUT", url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
             
@@ -194,7 +235,7 @@ class LarkClient:
             
             try:
                 logger.info(f"Batch updating {len(chunk)} records in table {table_id}...")
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                response = self._send_request("POST", url, headers=headers, json=payload)
                 if response.status_code != 200:
                     logger.error(f"HTTP Status {response.status_code} from Lark: {response.text}")
                 response.raise_for_status()
@@ -235,7 +276,7 @@ class LarkClient:
             
             try:
                 logger.info(f"Batch creating {len(chunk)} records in table {table_id}...")
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                response = self._send_request("POST", url, headers=headers, json=payload)
                 response.raise_for_status()
                 data = response.json()
                 
@@ -275,7 +316,7 @@ class LarkClient:
             
             try:
                 logger.info(f"Batch deleting {len(chunk)} records in table {table_id}...")
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                response = self._send_request("POST", url, headers=headers, json=payload)
                 response.raise_for_status()
                 data = response.json()
                 
@@ -313,7 +354,7 @@ class LarkClient:
                 params["page_token"] = page_token
 
             try:
-                response = requests.get(url, headers=headers, params=params, timeout=30)
+                response = self._send_request("GET", url, headers=headers, params=params)
                 response.raise_for_status()
                 data = response.json()
 
@@ -372,7 +413,7 @@ class LarkClient:
                 
             headers = self.get_headers()
             try:
-                response = requests.get(url, headers=headers, params=params, timeout=30)
+                response = self._send_request("GET", url, headers=headers, params=params)
                 response.raise_for_status()
                 data = response.json()
                 

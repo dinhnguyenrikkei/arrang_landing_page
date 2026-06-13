@@ -10,6 +10,13 @@ logger = logging.getLogger(__name__)
 # Vietnam Timezone (GMT+7)
 tz_vietnam = timezone(timedelta(hours=7))
 
+# Mappings caches for TVV (15 minutes TTL)
+_tvv_name_to_userid_cache = None
+_tvv_name_to_userid_expires_at = 0.0
+
+_tvv_name_to_link_cache = None
+_tvv_name_to_link_expires_at = 0.0
+
 def get_today_range() -> Tuple[int, int]:
     """
     Get the millisecond timestamps for the start and end of today in Vietnam timezone.
@@ -169,7 +176,7 @@ def detect_tvv_columns(records: List[Dict[str, Any]], date_candidates: List[str]
     Returns: (active_field, personnel_field, region_field, role_field)
     """
     all_keys = set()
-    for rec in records:
+    for rec in records[:50]:  # Optimize: only scan the first 50 records to extract column names
         all_keys.update(rec.get("fields", {}).keys())
         
     active_field = None
@@ -243,7 +250,7 @@ def detect_tvv_columns(records: List[Dict[str, Any]], date_candidates: List[str]
             
     return active_field, personnel_field, region_field, role_field
 
-def fetch_active_agents(client: LarkClient, role: str) -> List[Dict[str, Any]]:
+def fetch_active_agents(client: LarkClient, role: str, only_active: bool = True) -> List[Dict[str, Any]]:
     """
     Fetch active agents (TTS or TVV) from Bitable TVV Table.
     """
@@ -339,7 +346,7 @@ def fetch_active_agents(client: LarkClient, role: str) -> List[Dict[str, Any]]:
                 
             # Check if active today
             is_active = fields.get(active_col, False)
-            if not is_active:
+            if only_active and not is_active:
                 continue
                 
             # Parse Personnel field
@@ -437,7 +444,16 @@ def fetch_today_schedule(client: LarkClient) -> List[Dict[str, Any]]:
     """
     try:
         start_ms, end_ms = get_today_range()
-        records = client.list_records(config.TABLE_TIKTOK_ID)
+        
+        # Optimize: Lọc server-side bằng filter_formula của Lark Bitable
+        now_vn = datetime.now(tz_vietnam)
+        filter_formula = (
+            f"OR("
+            f"CurrentValue.[{config.FIELD_TIKTOK_CALLBACK_TIME}] >= DATE({now_vn.year}, {now_vn.month}, {now_vn.day}), "
+            f"CurrentValue.[{config.FIELD_TIKTOK_ASSIGNED_TIME}] >= DATE({now_vn.year}, {now_vn.month}, {now_vn.day})"
+            f")"
+        )
+        records = client.list_records(config.TABLE_TIKTOK_ID, filter_formula=filter_formula)
         
         today_schedule = []
         for rec in records:
@@ -522,15 +538,30 @@ def select_best_tvv_for_lead(
     lead_region: str,
     target_callback_time: int,
     active_tvvs: List[Dict[str, Any]],
-    today_assignments: List[Dict[str, Any]]
+    today_assignments: List[Dict[str, Any]],
+    client: Optional[LarkClient] = None
 ) -> Tuple[Optional[Dict[str, Any]], int]:
     """
     Select the best available TVV for a lead using regional preference, cooldown-based availability,
     and round-robin workload distribution. Shifting callback time if busy.
     Returns: (selected_tvv_dict, final_callback_time)
     """
-    # Calculate metrics for each active TVV
-    for tvv in active_tvvs:
+    tvvs_to_evaluate = list(active_tvvs)
+    
+    # RÀNG BUỘC CỨNG: Dữ liệu miền Nam chỉ chia cho tư vấn viên miền Nam.
+    # Nếu không có TVV miền Nam nào đi làm hôm nay, chia đều cho tất cả TVV miền Nam (kể cả nghỉ).
+    has_active_south = any(t["region"] == "Miền Nam" for t in active_tvvs)
+    if lead_region == "Miền Nam" and not has_active_south and client is not None:
+        try:
+            all_tvvs = fetch_active_agents(client, "TVV", only_active=False)
+            south_tvvs = [t for t in all_tvvs if t["region"] == "Miền Nam"]
+            logger.info(f"Không có TVV miền Nam nào đi làm hôm nay. Sử dụng toàn bộ {len(south_tvvs)} TVV miền Nam để chia.")
+            tvvs_to_evaluate = south_tvvs
+        except Exception as e:
+            logger.error(f"Lỗi khi lấy danh sách toàn bộ TVV miền Nam: {e}")
+
+    # Calculate metrics for each TVV to evaluate
+    for tvv in tvvs_to_evaluate:
         # Use recipient_user_id for matching (this is what gets written to TikTok records)
         match_id = tvv.get("recipient_user_id", tvv["user_id"])
         # Count assignments today
@@ -547,8 +578,12 @@ def select_best_tvv_for_lead(
     selected_tvv = None
     
     # Split candidates into primary region and other region
-    primary_tvvs = [t for t in active_tvvs if t["region"] == lead_region]
-    other_tvvs = [t for t in active_tvvs if t["region"] != lead_region]
+    primary_tvvs = [t for t in tvvs_to_evaluate if t["region"] == lead_region]
+    other_tvvs = [t for t in tvvs_to_evaluate if t["region"] != lead_region]
+    
+    # Dữ liệu miền Nam không cho phép tràn vùng sang các miền khác (other_tvvs sẽ rỗng).
+    if lead_region == "Miền Nam":
+        other_tvvs = []
     
     # Tier 1: Try same region TVVs who are free (based on cooldown)
     tier1_candidates = [t for t in primary_tvvs if t["is_free"]]
@@ -575,7 +610,7 @@ def select_best_tvv_for_lead(
                 primary_tvvs.sort(key=lambda x: (x["count_today"] / x.get("weight", 1.0), x["last_assigned_time"]))
                 selected_tvv = primary_tvvs[0]
                 logger.info(f"Selected TVV {selected_tvv['name']} from same region as fallback (busy).")
-            else:
+            elif other_tvvs:
                 other_tvvs.sort(key=lambda x: (x["count_today"] / x.get("weight", 1.0), x["last_assigned_time"]))
                 selected_tvv = other_tvvs[0]
                 logger.info(f"Selected TVV {selected_tvv['name']} from other region as fallback (busy).")
@@ -685,6 +720,11 @@ def build_tvv_name_to_userid_map(client: LarkClient) -> Dict[str, str]:
 
     Falls back to contact user list if dispatch table personnel are text-only.
     """
+    global _tvv_name_to_userid_cache, _tvv_name_to_userid_expires_at
+    current_time = time.time()
+    if _tvv_name_to_userid_cache is not None and current_time < _tvv_name_to_userid_expires_at:
+        return _tvv_name_to_userid_cache
+
     name_to_userid = {}
 
     try:
@@ -770,6 +810,8 @@ def build_tvv_name_to_userid_map(client: LarkClient) -> Dict[str, str]:
     except Exception as e:
         logger.error(f"Error building TVV name→user_id map: {e}")
 
+    _tvv_name_to_userid_cache = name_to_userid
+    _tvv_name_to_userid_expires_at = current_time + 900  # Cache for 15 minutes
     logger.info(f"Built TVV name mapping with {len(name_to_userid)} entries.")
     return name_to_userid
 
@@ -780,6 +822,11 @@ def build_tvv_name_to_link_map(client: LarkClient) -> Dict[str, str]:
     Used for DuplexLink (type 21) fields where we need the record_id in the linked table
     (Tỷ lệ chuyển đổi) to write via API format [record_id].
     """
+    global _tvv_name_to_link_cache, _tvv_name_to_link_expires_at
+    current_time = time.time()
+    if _tvv_name_to_link_cache is not None and current_time < _tvv_name_to_link_expires_at:
+        return _tvv_name_to_link_cache
+
     name_to_link = {}
     try:
         records = client.list_records(config.TABLE_TVV_ID)
@@ -845,6 +892,8 @@ def build_tvv_name_to_link_map(client: LarkClient) -> Dict[str, str]:
     except Exception as e:
         logger.error(f"Error building TVV name→link_record_id map: {e}")
     
+    _tvv_name_to_link_cache = name_to_link
+    _tvv_name_to_link_expires_at = current_time + 900  # Cache for 15 minutes
     logger.info(f"Built TVV name→link map with {len(name_to_link)} entries.")
     return name_to_link
 
@@ -855,7 +904,13 @@ def fetch_today_facebook_assignments(client: LarkClient) -> List[Dict[str, Any]]
     """
     try:
         start_ms, end_ms = get_today_range()
-        records = client.list_records(config.TABLE_TIKTOK_ID)
+        
+        # Optimize: Lọc server-side bằng filter_formula của Lark Bitable
+        now_vn = datetime.now(tz_vietnam)
+        filter_formula = (
+            f"CurrentValue.[{config.FIELD_TIKTOK_ASSIGNED_TIME}] >= DATE({now_vn.year}, {now_vn.month}, {now_vn.day})"
+        )
+        records = client.list_records(config.TABLE_TIKTOK_ID, filter_formula=filter_formula)
         
         today_assignments = []
         for rec in records:
@@ -1035,7 +1090,7 @@ def assign_m0_lead_to_tvv(client: LarkClient, lead_record_id: str) -> Optional[D
             return None
         today_schedule = fetch_today_schedule(client)
         selected, final_cb = select_best_tvv_for_lead(
-            lead_region, target_callback_time, active_tvvs, today_schedule
+            lead_region, target_callback_time, active_tvvs, today_schedule, client
         )
         if selected:
             recipient_uid = selected.get("recipient_user_id") or selected["user_id"]
@@ -1097,7 +1152,7 @@ def assign_m0_lead_to_tvv(client: LarkClient, lead_record_id: str) -> Optional[D
             return None
         today_schedule = fetch_today_schedule(client)
         selected, final_cb = select_best_tvv_for_lead(
-            lead_region, target_callback_time, active_tvvs, today_schedule
+            lead_region, target_callback_time, active_tvvs, today_schedule, client
         )
         if selected:
             recipient_uid = selected.get("recipient_user_id") or selected["user_id"]
@@ -1391,7 +1446,7 @@ def assign_m0_leads_batch(client: LarkClient, lead_records: List[Dict[str, Any]]
                 target_callback_time = callback_time if callback_time is not None else current_time_ms
                 
                 selected, final_cb = select_best_tvv_for_lead(
-                    lead_region, target_callback_time, active_tvvs, today_schedule
+                    lead_region, target_callback_time, active_tvvs, today_schedule, client
                 )
                 
                 if selected:
@@ -1514,7 +1569,7 @@ def assign_m0_leads_batch(client: LarkClient, lead_records: List[Dict[str, Any]]
                 target_callback_time = callback_time if callback_time is not None else current_time_ms
                 
                 selected_tvv, final_callback_time = select_best_tvv_for_lead(
-                    lead_region, target_callback_time, active_tvvs, today_schedule
+                    lead_region, target_callback_time, active_tvvs, today_schedule, client
                 )
                 
                 if selected_tvv:

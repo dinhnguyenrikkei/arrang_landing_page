@@ -52,7 +52,7 @@ class TestConfigManager(unittest.TestCase):
         self.assertEqual(values["MAX_ASSIGNMENTS_PER_DAY"], "5")
         self.assertEqual(values["SYNC_INTERVAL_SECONDS"], "120")
         # Unspecified keys should fall back to empty string or default defined in config_manager
-        self.assertEqual(values["COOLDOWN_MINUTES_BETWEEN_CALLS"], "30")
+        self.assertEqual(values["COOLDOWN_MINUTES_BETWEEN_CALLS"], "15")
 
     def test_update_env_values(self):
         # Pre-populate temp file with some keys
