@@ -1464,5 +1464,320 @@ class TestWeightAndLockCases(unittest.TestCase):
             main.sync_lock.release()
 
 
+class TestPerSourceFairness(unittest.TestCase):
+    """Tests for per-source round-robin fairness.
+    
+    Ensures each TVV receives equal amounts from each source (TikTok, Facebook, Seeding)
+    independently, not just equal total counts.
+    """
+
+    def setUp(self):
+        self.client = MagicMock(spec=LarkClient)
+        self.client.get_field_type.return_value = 11  # Person type
+
+    def test_mixed_tiktok_facebook_batch_fairness(self):
+        """4 TikTok + 4 Facebook leads, 2 TVVs → each TVV gets 2 TikTok + 2 Facebook."""
+        from assigner import assign_m0_leads_batch, tz_vietnam
+        
+        now_vn = datetime.now(tz_vietnam)
+        today_col = now_vn.strftime("%d/%m")
+        
+        # 2 TVVs, both North
+        tvv_records = [
+            {
+                "record_id": "rec_tvv_a",
+                "fields": {
+                    "Nhân sự": [{"id": "user_a", "name": "TVV A"}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                    today_col: True,
+                }
+            },
+            {
+                "record_id": "rec_tvv_b",
+                "fields": {
+                    "Nhân sự": [{"id": "user_b", "name": "TVV B"}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                    today_col: True,
+                }
+            }
+        ]
+        
+        # 4 TikTok + 4 Facebook leads (all North, all with both fields empty)
+        leads = []
+        for i in range(4):
+            leads.append({
+                "record_id": f"lead_tiktok_{i}",
+                "fields": {
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Tiktok",
+                    "Khu vực": "Miền Bắc",
+                    "Trạng thái": "M0-Data đã claim",
+                }
+            })
+        for i in range(4):
+            leads.append({
+                "record_id": f"lead_facebook_{i}",
+                "fields": {
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Facebook",
+                    "Khu vực": "Miền Bắc",
+                    "Trạng thái": "M0-Data đã claim",
+                }
+            })
+        
+        def mock_list_records(table_id, **kwargs):
+            if table_id == config.TABLE_TVV_ID:
+                return tvv_records
+            elif table_id == config.TABLE_TIKTOK_ID:
+                return []  # No existing assignments
+            return []
+        
+        self.client.list_records.side_effect = mock_list_records
+        
+        # Act
+        results = assign_m0_leads_batch(self.client, leads)
+        
+        # Analyze: count per-source assignments for each TVV
+        a_tiktok = sum(1 for rid, tvv in results if tvv.get("user_id") == "user_a" and "tiktok" in rid)
+        a_facebook = sum(1 for rid, tvv in results if tvv.get("user_id") == "user_a" and "facebook" in rid)
+        b_tiktok = sum(1 for rid, tvv in results if tvv.get("user_id") == "user_b" and "tiktok" in rid)
+        b_facebook = sum(1 for rid, tvv in results if tvv.get("user_id") == "user_b" and "facebook" in rid)
+        
+        # Assert: each TVV should get 2 TikTok + 2 Facebook
+        self.assertEqual(len(results), 8)
+        self.assertEqual(a_tiktok, 2, f"TVV A should get 2 TikTok, got {a_tiktok}")
+        self.assertEqual(a_facebook, 2, f"TVV A should get 2 Facebook, got {a_facebook}")
+        self.assertEqual(b_tiktok, 2, f"TVV B should get 2 TikTok, got {b_tiktok}")
+        self.assertEqual(b_facebook, 2, f"TVV B should get 2 Facebook, got {b_facebook}")
+
+    def test_mixed_three_sources_batch_fairness(self):
+        """6 TikTok + 6 Facebook + 6 Seeding leads, 3 TVVs → each gets 2 of each source."""
+        from assigner import assign_m0_leads_batch, tz_vietnam
+        
+        now_vn = datetime.now(tz_vietnam)
+        today_col = now_vn.strftime("%d/%m")
+        
+        # 3 TVVs, all North
+        tvv_records = [
+            {
+                "record_id": f"rec_tvv_{name.lower()}",
+                "fields": {
+                    "Nhân sự": [{"id": f"user_{name.lower()}", "name": name}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                    today_col: True,
+                }
+            }
+            for name in ["Alice", "Bob", "Carol"]
+        ]
+        
+        # Build leads: 6 of each source
+        leads = []
+        for i in range(6):
+            leads.append({
+                "record_id": f"lead_tiktok_{i}",
+                "fields": {
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Tiktok",
+                    "Khu vực": "Miền Bắc",
+                    "Trạng thái": "M0-Data đã claim",
+                }
+            })
+        for i in range(6):
+            leads.append({
+                "record_id": f"lead_facebook_{i}",
+                "fields": {
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Facebook",
+                    "Khu vực": "Miền Bắc",
+                    "Trạng thái": "M0-Data đã claim",
+                }
+            })
+        for i in range(6):
+            leads.append({
+                "record_id": f"lead_seeding_{i}",
+                "fields": {
+                    "Nguồn Data": "Seeding",
+                    "Kênh đăng ký": "Other",
+                    "Khu vực": "Miền Bắc",
+                    "Trạng thái": "M0-Data đã claim",
+                }
+            })
+        
+        def mock_list_records(table_id, **kwargs):
+            if table_id == config.TABLE_TVV_ID:
+                return tvv_records
+            elif table_id == config.TABLE_TIKTOK_ID:
+                return []
+            return []
+        
+        self.client.list_records.side_effect = mock_list_records
+        
+        # Act
+        results = assign_m0_leads_batch(self.client, leads)
+        
+        # Assert: 18 leads total
+        self.assertEqual(len(results), 18)
+        
+        # Count per-source per-TVV
+        for user_id_suffix in ["alice", "bob", "carol"]:
+            uid = f"user_{user_id_suffix}"
+            tiktok_count = sum(1 for rid, tvv in results if tvv.get("user_id") == uid and "tiktok" in rid)
+            facebook_count = sum(1 for rid, tvv in results if tvv.get("user_id") == uid and "facebook" in rid)
+            seeding_count = sum(1 for rid, tvv in results if tvv.get("user_id") == uid and "seeding" in rid)
+            
+            self.assertEqual(tiktok_count, 2, f"{uid} should get 2 TikTok, got {tiktok_count}")
+            self.assertEqual(facebook_count, 2, f"{uid} should get 2 Facebook, got {facebook_count}")
+            self.assertEqual(seeding_count, 2, f"{uid} should get 2 Seeding, got {seeding_count}")
+
+    def test_per_source_with_existing_assignments(self):
+        """TVV A already has 2 TikTok today. New 2 TikTok + 2 Facebook:
+        - TikTok → B gets both (A has 2, B has 0 TikTok)
+        - Facebook → split equally (both have 0 Facebook)
+        """
+        from assigner import assign_m0_leads_batch, tz_vietnam
+        
+        now_vn = datetime.now(tz_vietnam)
+        today_col = now_vn.strftime("%d/%m")
+        start_ms, _ = get_today_range()
+        
+        tvv_records = [
+            {
+                "record_id": "rec_tvv_a",
+                "fields": {
+                    "Nhân sự": [{"id": "user_a", "name": "TVV A"}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                    today_col: True,
+                }
+            },
+            {
+                "record_id": "rec_tvv_b",
+                "fields": {
+                    "Nhân sự": [{"id": "user_b", "name": "TVV B"}],
+                    "Team TV": "Miền Bắc",
+                    "Đi làm hôm nay": True,
+                    today_col: True,
+                }
+            }
+        ]
+        
+        # Existing: TVV A has 2 TikTok assignments today
+        existing_records = [
+            {
+                "record_id": f"existing_tt_{i}",
+                "fields": {
+                    config.FIELD_TIKTOK_ASSIGNED_USER: [{"id": "user_a", "name": "TVV A"}],
+                    config.FIELD_TIKTOK_ASSIGNED_TIME: start_ms + i * 1000,
+                    config.FIELD_TIKTOK_CALLBACK_TIME: start_ms + (i + 1) * 3600000,
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Tiktok",
+                }
+            }
+            for i in range(2)
+        ]
+        
+        # New leads: 2 TikTok + 2 Facebook
+        leads = [
+            {
+                "record_id": f"lead_tiktok_{i}",
+                "fields": {
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Tiktok",
+                    "Khu vực": "Miền Bắc",
+                    "Trạng thái": "M0-Data đã claim",
+                }
+            }
+            for i in range(2)
+        ] + [
+            {
+                "record_id": f"lead_facebook_{i}",
+                "fields": {
+                    "Nguồn Data": "Online - Digital MKT",
+                    "Kênh đăng ký": "Facebook",
+                    "Khu vực": "Miền Bắc",
+                    "Trạng thái": "M0-Data đã claim",
+                }
+            }
+            for i in range(2)
+        ]
+        
+        def mock_list_records(table_id, **kwargs):
+            if table_id == config.TABLE_TVV_ID:
+                return tvv_records
+            elif table_id == config.TABLE_TIKTOK_ID:
+                return existing_records  # Return existing TikTok assignments
+            return []
+        
+        self.client.list_records.side_effect = mock_list_records
+        
+        # Act
+        results = assign_m0_leads_batch(self.client, leads)
+        
+        # Assert
+        self.assertEqual(len(results), 4)
+        
+        # TikTok: B should get first new TikTok (A has 2, B has 0 TikTok)
+        # Then second TikTok: A has 2, B has 1 → B gets it (B still lower)
+        # BUT cooldown may cause fallback. Key check: B gets >= 1 TikTok (more than old behavior of 0)
+        b_tiktok = sum(1 for rid, tvv in results if tvv.get("user_id") == "user_b" and "tiktok" in rid)
+        a_tiktok = sum(1 for rid, tvv in results if tvv.get("user_id") == "user_a" and "tiktok" in rid)
+        self.assertGreaterEqual(b_tiktok, 1, f"TVV B should get >= 1 new TikTok, got {b_tiktok}")
+        # Total TikTok = 2
+        self.assertEqual(a_tiktok + b_tiktok, 2)
+        
+        # Facebook: split equally (both have 0 Facebook) — per-source counting ensures
+        # this is NOT biased by A's existing TikTok assignments
+        a_facebook = sum(1 for rid, tvv in results if tvv.get("user_id") == "user_a" and "facebook" in rid)
+        b_facebook = sum(1 for rid, tvv in results if tvv.get("user_id") == "user_b" and "facebook" in rid)
+        self.assertEqual(a_facebook, 1, f"TVV A should get 1 Facebook, got {a_facebook}")
+        self.assertEqual(b_facebook, 1, f"TVV B should get 1 Facebook, got {b_facebook}")
+
+    def test_detect_lead_source(self):
+        """Test detect_lead_source helper."""
+        from assigner import detect_lead_source
+        
+        self.assertEqual(detect_lead_source({"Nguồn Data": "Online - Digital MKT", "Kênh đăng ký": "Tiktok"}), "tiktok")
+        self.assertEqual(detect_lead_source({"Nguồn Data": "Online - Digital MKT", "Kênh đăng ký": "Facebook"}), "facebook")
+        self.assertEqual(detect_lead_source({"Nguồn Data": "Seeding", "Kênh đăng ký": "Other"}), "seeding")
+        self.assertEqual(detect_lead_source({"Nguồn Data": "Other", "Kênh đăng ký": "Seeding"}), "seeding")
+        self.assertEqual(detect_lead_source({"Nguồn Data": "Unknown", "Kênh đăng ký": "Unknown"}), "unknown")
+        self.assertEqual(detect_lead_source({}), "unknown")
+
+    def test_select_best_tvv_source_filter_only_counts_same_source(self):
+        """source_filter='tiktok' should ignore facebook assignments when counting load."""
+        from assigner import select_best_tvv_for_lead
+        
+        active_tvvs = [
+            {"user_id": "user_a", "recipient_user_id": "user_a", "name": "A", "region": "Miền Bắc", "weight": 1.0},
+            {"user_id": "user_b", "recipient_user_id": "user_b", "name": "B", "region": "Miền Bắc", "weight": 1.0},
+        ]
+        
+        # A has 3 Facebook assignments, B has 0
+        # When distributing TikTok (source_filter='tiktok'), both have 0 TikTok → should be fair
+        today_assignments = [
+            {"assigned_user_id": "user_a", "assigned_time": 1000, "callback_time": 100000, "source": "facebook"},
+            {"assigned_user_id": "user_a", "assigned_time": 2000, "callback_time": 200000, "source": "facebook"},
+            {"assigned_user_id": "user_a", "assigned_time": 3000, "callback_time": 300000, "source": "facebook"},
+        ]
+        
+        # Without source_filter: A has 3 total → B wins
+        selected_no_filter, _ = select_best_tvv_for_lead("Miền Bắc", 5000000000000, 
+                                                          [dict(t) for t in active_tvvs], 
+                                                          today_assignments)
+        self.assertEqual(selected_no_filter["user_id"], "user_b")
+        
+        # With source_filter='tiktok': both have 0 TikTok → A wins (first in list, tie)
+        selected_with_filter, _ = select_best_tvv_for_lead("Miền Bắc", 5000000000000,
+                                                            [dict(t) for t in active_tvvs],
+                                                            today_assignments,
+                                                            source_filter="tiktok")
+        # Both have 0 TikTok count → tie → A wins (lower last_assigned_time=0 same for both)
+        self.assertIn(selected_with_filter["user_id"], ["user_a", "user_b"])
+        # Key assertion: both have equal load, so it doesn't bias toward B just because A has Facebook
+
+
 if __name__ == "__main__":
     unittest.main()

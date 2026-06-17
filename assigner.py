@@ -110,6 +110,19 @@ def is_eligible_for_seeding(fields: Dict[str, Any]) -> bool:
     
     return source == "Seeding" or channel == "Seeding"
 
+def detect_lead_source(fields: Dict[str, Any]) -> str:
+    """
+    Detect the source type of a lead for per-source round-robin distribution.
+    Returns: 'tiktok', 'facebook', 'seeding', or 'unknown'.
+    """
+    if is_eligible_for_tiktok(fields):
+        return "tiktok"
+    elif is_eligible_for_facebook(fields):
+        return "facebook"
+    elif is_eligible_for_seeding(fields):
+        return "seeding"
+    return "unknown"
+
 def parse_name_and_weight(name: str) -> Tuple[str, Optional[float]]:
     """
     Parses a name and extracts any weight percentage (like '50%' or '(50%)').
@@ -480,11 +493,15 @@ def fetch_today_schedule(client: LarkClient) -> List[Dict[str, Any]]:
                 if not assigned_user_id:
                     continue
                 
+                # Detect source for per-source round-robin fairness
+                lead_source = detect_lead_source(fields)
+                
                 today_schedule.append({
                     "record_id": rec.get("record_id"),
                     "assigned_user_id": assigned_user_id,
                     "assigned_time": assigned_time,
-                    "callback_time": callback_time
+                    "callback_time": callback_time,
+                    "source": lead_source,
                 })
                 
         logger.info(f"Found {len(today_schedule)} scheduled calls for today.")
@@ -539,11 +556,17 @@ def select_best_tvv_for_lead(
     target_callback_time: int,
     active_tvvs: List[Dict[str, Any]],
     today_assignments: List[Dict[str, Any]],
-    client: Optional[LarkClient] = None
+    client: Optional[LarkClient] = None,
+    source_filter: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], int]:
     """
     Select the best available TVV for a lead using regional preference, cooldown-based availability,
     and round-robin workload distribution. Shifting callback time if busy.
+    
+    source_filter: If provided (e.g. 'tiktok', 'facebook', 'seeding'), only count
+                   assignments of the same source when calculating load ratio.
+                   Cooldown check always uses ALL assignments (cross-source).
+    
     Returns: (selected_tvv_dict, final_callback_time)
     """
     tvvs_to_evaluate = list(active_tvvs)
@@ -564,15 +587,21 @@ def select_best_tvv_for_lead(
     for tvv in tvvs_to_evaluate:
         # Use recipient_user_id for matching (this is what gets written to TikTok records)
         match_id = tvv.get("recipient_user_id", tvv["user_id"])
-        # Count assignments today
-        tvv_assignments = [a for a in today_assignments if a["assigned_user_id"] == match_id]
+        
+        # Count assignments today — per-source if source_filter is provided
+        if source_filter:
+            tvv_assignments = [a for a in today_assignments
+                               if a["assigned_user_id"] == match_id
+                               and a.get("source") == source_filter]
+        else:
+            tvv_assignments = [a for a in today_assignments if a["assigned_user_id"] == match_id]
         tvv["count_today"] = len(tvv_assignments)
         
-        # Last assignment time today
+        # Last assignment time today (per-source for consistent tie-breaking)
         valid_times = [a["assigned_time"] for a in tvv_assignments if a.get("assigned_time") is not None]
         tvv["last_assigned_time"] = max(valid_times) if valid_times else 0
         
-        # Availability based on schedule
+        # Availability based on schedule — ALWAYS cross-source (a TVV busy with TikTok is also busy for Facebook)
         tvv["is_free"] = check_tvv_availability(match_id, target_callback_time, today_assignments)
 
     selected_tvv = None
@@ -1078,6 +1107,9 @@ def assign_m0_lead_to_tvv(client: LarkClient, lead_record_id: str) -> Optional[D
     
     logger.info(f"Lead Region: {lead_region}, Callback Time: {callback_time}, TVV empty: {tvv_empty}, Recipient empty: {recipient_empty}")
     
+    # Detect lead source for per-source round-robin fairness
+    lead_source = detect_lead_source(fields)
+    
     update_fields = {}
     result_info = None
     
@@ -1090,7 +1122,8 @@ def assign_m0_lead_to_tvv(client: LarkClient, lead_record_id: str) -> Optional[D
             return None
         today_schedule = fetch_today_schedule(client)
         selected, final_cb = select_best_tvv_for_lead(
-            lead_region, target_callback_time, active_tvvs, today_schedule, client
+            lead_region, target_callback_time, active_tvvs, today_schedule, client,
+            source_filter=lead_source,
         )
         if selected:
             recipient_uid = selected.get("recipient_user_id") or selected["user_id"]
@@ -1152,7 +1185,8 @@ def assign_m0_lead_to_tvv(client: LarkClient, lead_record_id: str) -> Optional[D
             return None
         today_schedule = fetch_today_schedule(client)
         selected, final_cb = select_best_tvv_for_lead(
-            lead_region, target_callback_time, active_tvvs, today_schedule, client
+            lead_region, target_callback_time, active_tvvs, today_schedule, client,
+            source_filter=lead_source,
         )
         if selected:
             recipient_uid = selected.get("recipient_user_id") or selected["user_id"]
@@ -1445,8 +1479,12 @@ def assign_m0_leads_batch(client: LarkClient, lead_records: List[Dict[str, Any]]
                 callback_time = fields.get(config.FIELD_TIKTOK_CALLBACK_TIME)
                 target_callback_time = callback_time if callback_time is not None else current_time_ms
                 
+                # Detect source for per-source round-robin fairness
+                lead_source = detect_lead_source(fields)
+                
                 selected, final_cb = select_best_tvv_for_lead(
-                    lead_region, target_callback_time, active_tvvs, today_schedule, client
+                    lead_region, target_callback_time, active_tvvs, today_schedule, client,
+                    source_filter=lead_source,
                 )
                 
                 if selected:
@@ -1471,7 +1509,8 @@ def assign_m0_leads_batch(client: LarkClient, lead_records: List[Dict[str, Any]]
                         "record_id": lead_record_id,
                         "assigned_user_id": recipient_uid,
                         "assigned_time": current_time_ms,
-                        "callback_time": final_cb
+                        "callback_time": final_cb,
+                        "source": lead_source,
                     })
                     
                     assigned_results.append((lead_record_id, {"name": selected["name"], "user_id": recipient_uid}))
@@ -1568,8 +1607,12 @@ def assign_m0_leads_batch(client: LarkClient, lead_records: List[Dict[str, Any]]
                 callback_time = fields.get(config.FIELD_TIKTOK_CALLBACK_TIME)
                 target_callback_time = callback_time if callback_time is not None else current_time_ms
                 
+                # Detect source for per-source round-robin fairness
+                lead_source = detect_lead_source(fields)
+                
                 selected_tvv, final_callback_time = select_best_tvv_for_lead(
-                    lead_region, target_callback_time, active_tvvs, today_schedule, client
+                    lead_region, target_callback_time, active_tvvs, today_schedule, client,
+                    source_filter=lead_source,
                 )
                 
                 if selected_tvv:
@@ -1619,7 +1662,8 @@ def assign_m0_leads_batch(client: LarkClient, lead_records: List[Dict[str, Any]]
                         "record_id": lead_record_id,
                         "assigned_user_id": recipient_uid,
                         "assigned_time": current_time_ms,
-                        "callback_time": final_callback_time
+                        "callback_time": final_callback_time,
+                        "source": lead_source,
                     })
                     
                     assigned_results.append((lead_record_id, selected_tvv))
